@@ -880,11 +880,11 @@ elif pagina == "Retiradas":
     ])
 
     with aba_nova:
-        st.subheader("Nova Retirada Presencial")
+    
         with st.form("form_nova_retirada", clear_on_submit=True):
-            nome_cli = st.text_input("Nome do Cliente *", placeholder="Ex.: Maria Souza")
-            itens_ret = st.text_area("Item / Itens a retirar *", placeholder="Ex.: Panela de Pressão Electrolux + Conjunto de Copos")
-            obs_ret = st.text_input("Observações (OBS)", placeholder="Ex.: Já pago via PIX / Retira no sábado à tarde")
+            nome_cli = st.text_input("Nome  *", placeholder="Ex.: Miguel")
+            itens_ret = st.text_area("Item / Itens a retirar *", placeholder="Ex.: Lote , Brinquedo")
+            obs_ret = st.text_input("Observações (OBS)", placeholder="Ex.: Retirar antes do meio-dia")
 
             salvar_ret = st.form_submit_button("Cadastrar Retirada", type="primary")
 
@@ -899,7 +899,7 @@ elif pagina == "Retiradas":
                     st.rerun()
 
     with aba_gerenciar:
-        st.subheader("Retiradas Aguardando Busca")
+
         busca_ret = st.text_input("Buscar por cliente ou item", key="busca_ret_pendente")
 
         retiradas_pendentes = listar_retiradas(status="Pendente")
