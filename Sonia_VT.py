@@ -900,7 +900,7 @@ elif pagina == "Retiradas":
 
     with aba_gerenciar:
 
-        busca_ret = st.text_input("Buscar por cliente ou item", key="busca_ret_pendente")
+        busca_ret = st.text_input("Buscar por Nome ou item", key="busca_ret_pendente")
 
         retiradas_pendentes = listar_retiradas(status="Pendente")
 
@@ -1056,7 +1056,6 @@ elif pagina == "Etiquetas e Histórico":
                     st.toast("Lote de etiquetas registrado no histórico!")
 
     with aba_historico:
-        st.subheader("Histórico de PDFs / Lotes Gerados")
         historico = listar_historico_etiquetas()
 
         if not historico:
