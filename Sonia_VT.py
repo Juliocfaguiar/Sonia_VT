@@ -80,6 +80,16 @@ def inicializar_banco():
                 detalhes_pedidos TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS retiradas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                nome_cliente TEXT NOT NULL,
+                itens TEXT NOT NULL,
+                observacoes TEXT DEFAULT '',
+                data_registro TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'Pendente',
+                data_conclusao TEXT
+            );
+
             CREATE INDEX IF NOT EXISTS idx_pedidos_data
             ON pedidos(data_entrega);
 
@@ -92,7 +102,7 @@ inicializar_banco()
 
 
 # --------------------------------------------------
-# FUNÇÕES AUXILIARES
+# FUNÇÕES AUXILIARES DE PEDIDOS E CLIENTES
 # --------------------------------------------------
 
 def proximo_sabado():
@@ -233,7 +243,55 @@ def listar_historico_etiquetas():
 
 
 # --------------------------------------------------
-# GERADOR DE ETIQUETAS EM PDF (REPORTLAB)
+# FUNÇÕES AUXILIARES DE RETIRADAS
+# --------------------------------------------------
+
+def criar_retirada(nome_cliente, itens, observacoes):
+    agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with conectar() as con:
+        con.execute("""
+            INSERT INTO retiradas (nome_cliente, itens, observacoes, data_registro, status)
+            VALUES (?, ?, ?, ?, 'Pendente')
+        """, (nome_cliente.strip(), itens.strip(), observacoes.strip(), agora))
+
+
+def listar_retiradas(status=None):
+    sql = "SELECT * FROM retiradas WHERE 1=1"
+    parametros = []
+    if status:
+        sql += " AND status = ?"
+        parametros.append(status)
+    sql += " ORDER BY id DESC"
+    with conectar() as con:
+        return con.execute(sql, parametros).fetchall()
+
+
+def atualizar_retirada(retirada_id, nome_cliente, itens, observacoes):
+    with conectar() as con:
+        con.execute("""
+            UPDATE retiradas
+            SET nome_cliente = ?, itens = ?, observacoes = ?
+            WHERE id = ?
+        """, (nome_cliente.strip(), itens.strip(), observacoes.strip(), retirada_id))
+
+
+def concluir_retirada(retirada_id):
+    agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with conectar() as con:
+        con.execute("""
+            UPDATE retiradas
+            SET status = 'Concluída', data_conclusao = ?
+            WHERE id = ?
+        """, (agora, retirada_id))
+
+
+def excluir_retirada(retirada_id):
+    with conectar() as con:
+        con.execute("DELETE FROM retiradas WHERE id = ?", (retirada_id,))
+
+
+# --------------------------------------------------
+# GERADOR DE ETIQUETAS EM PDF
 # --------------------------------------------------
 
 def gerar_pdf_etiquetas(pedidos):
@@ -249,10 +307,10 @@ def gerar_pdf_etiquetas(pedidos):
 
     styles = getSampleStyleSheet()
     
-    style_de = ParagraphStyle('EtiquetaDe', parent=styles['Normal'], fontSize=11, leading=14, fontName='Helvetica-Bold', textColor=colors.HexColor('#555555'))
-    style_para = ParagraphStyle('EtiquetaPara', parent=styles['Normal'], fontSize=12, leading=15, fontName='Helvetica-Bold', textColor=colors.HexColor('#000000'))
-    style_local = ParagraphStyle('EtiquetaLocal', parent=styles['Normal'], fontSize=10, leading=13, fontName='Helvetica-Oblique', textColor=colors.HexColor('#333333'))
-    style_itens = ParagraphStyle('EtiquetaItens', parent=styles['Normal'], fontSize=10, leading=13, fontName='Helvetica', textColor=colors.HexColor('#111111'))
+    style_de = ParagraphStyle('EtiquetaDe', parent=styles['Normal'], fontSize=13, leading=16, fontName='Helvetica-Bold', textColor=colors.HexColor('#222222'))
+    style_para = ParagraphStyle('EtiquetaPara', parent=styles['Normal'], fontSize=15, leading=18, fontName='Helvetica-Bold', textColor=colors.HexColor('#000000'))
+    style_itens = ParagraphStyle('EtiquetaItens', parent=styles['Normal'], fontSize=9.5, leading=12, fontName='Helvetica', textColor=colors.HexColor('#111111'))
+    style_obs = ParagraphStyle('EtiquetaObs', parent=styles['Normal'], fontSize=9, leading=11, fontName='Helvetica-Oblique', textColor=colors.HexColor('#444444'))
 
     cards = []
 
@@ -260,35 +318,36 @@ def gerar_pdf_etiquetas(pedidos):
         itens = obter_itens(p["id"])
         itens_txt = " + ".join([i['produto'] for i in itens])
         
-        obs_txt = f"<br/><b>Obs:</b> {p['observacoes']}" if p['observacoes'] else ""
-        local_txt = f"<b>Local:</b> {p['local_entrega']}{obs_txt}"
+        info_obs = p['local_entrega']
+        if p['observacoes']:
+            info_obs += f" ({p['observacoes']})"
 
         conteudo = [
-            Paragraph(f"<b>De:</b> Sônia Vende Tudo", style_de),
-            Paragraph(f"<b>Para:</b> {p['cliente']}", style_para),
-            Paragraph(local_txt, style_local),
-            Paragraph(f"<b>Itens:</b> {itens_txt}", style_itens)
+            Paragraph("<b>De: Sônia Vende Tudo</b>", style_de),
+            Paragraph(f"<b>Para: {p['cliente']}</b>", style_para),
+            Paragraph(f"{itens_txt}", style_itens),
+            Paragraph(f"<b>Obs:</b> {info_obs}", style_obs)
         ]
 
-        t_card = Table([[c] for c in conteudo], colWidths=[8.8 * cm])
+        t_card = Table([[c] for c in conteudo], colWidths=[9.2 * cm])
         t_card.setStyle(TableStyle([
-            ('BOX', (0,0), (-1,-1), 1, colors.HexColor('#A0A0A0')),
-            ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#FAFAFA')),
-            ('TOPPADDING', (0,0), (-1,-1), 6),
-            ('BOTTOMPADDING', (0,0), (-1,-1), 6),
-            ('LEFTPADDING', (0,0), (-1,-1), 8),
-            ('RIGHTPADDING', (0,0), (-1,-1), 8),
+            ('BOX', (0, 0), (-1, -1), 1.2, colors.HexColor('#333333')),
+            ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#FFFFFF')),
+            ('TOPPADDING', (0, 0), (-1, -1), 8),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+            ('LEFTPADDING', (0, 0), (-1, -1), 10),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 10),
         ]))
         cards.append(t_card)
 
     rows = []
     for i in range(0, len(cards), 2):
         if i + 1 < len(cards):
-            rows.append([cards[i], cards[i+1]])
+            rows.append([cards[i], cards[i + 1]])
         else:
             rows.append([cards[i], ""])
 
-    grid = Table(rows, colWidths=[9.3 * cm, 9.3 * cm])
+    grid = Table(rows, colWidths=[9.5 * cm, 9.5 * cm])
     grid.setStyle(TableStyle([
         ('VALIGN', (0, 0), (-1, -1), 'TOP'),
         ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
@@ -314,6 +373,7 @@ pagina = st.sidebar.radio(
         "Gerenciar pedidos",
         "Separação",
         "Entregas de sábado",
+        "Retiradas",
         "Etiquetas e Histórico",
         "Histórico Geral"
     ]
@@ -338,17 +398,41 @@ if pagina == "Painel inicial":
 
     pedidos = listar_pedidos()
     clientes = listar_clientes()
+    retiradas_pendentes = listar_retiradas(status="Pendente")
 
     pendentes = [p for p in pedidos if p["status"] == "Pendente"]
     prontos = [p for p in pedidos if p["status"] == "Pronto para entrega"]
     entregues = [p for p in pedidos if p["status"] == "Entregue"]
 
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Clientes", len(clientes))
     col2.metric("Pedidos pendentes", len(pendentes))
     col3.metric("Prontos para entrega", len(prontos))
     col4.metric("Pedidos entregues", len(entregues))
+    col5.metric("Retiradas pendentes", len(retiradas_pendentes))
 
+    st.divider()
+    st.subheader("📈 Quantidade de Itens Entregues por Data")
+
+    dados_grafico = []
+    for p in entregues:
+        if p["data_conclusao"]:
+            data_str = p["data_conclusao"][:10]
+            itens_ped = obter_itens(p["id"])
+            qtd_itens = sum([i["quantidade"] for i in itens_ped])
+            dados_grafico.append({"Data": data_str, "Itens Entregues": qtd_itens})
+
+    if dados_grafico:
+        df_graf = pd.DataFrame(dados_grafico)
+        df_agrupado = df_graf.groupby("Data", as_index=False)["Itens Entregues"].sum()
+        df_agrupado = df_agrupado.sort_values("Data")
+        df_agrupado.set_index("Data", inplace=True)
+
+        st.line_chart(df_agrupado)
+    else:
+        st.info("Ainda não há registros de pedidos entregues com data de conclusão para exibir no gráfico.")
+
+    st.divider()
     st.subheader("Próximo sábado")
     data_sabado = proximo_sabado()
     st.write(formatar_data(str(data_sabado)))
@@ -528,11 +612,11 @@ elif pagina == "Novo pedido":
         tipo_entrega = "Entrega"
 
         local_entrega = st.text_input(
-            "Local de entrega / Endereço / Estação",
-            placeholder="Ex.: Estação Vila das Belezas ou Endereço residencial"
+            "Local de entrega / Estação / Endereço",
+            placeholder="Ex.: Estação Vila das Belezas ou Endereço"
         )
 
-        observacoes = st.text_area("Observações do pedido (ex.: Entregar para fulano)")
+        observacoes = st.text_area("Observações (ex.: Entregar para fulano)")
 
         itens_df = pd.DataFrame([
             {"Produto": "", "Quantidade": 1.0, "Unidade": "un"}
@@ -783,6 +867,150 @@ elif pagina == "Entregas de sábado":
 
 
 # --------------------------------------------------
+# RETIRADAS
+# --------------------------------------------------
+
+elif pagina == "Retiradas":
+    st.title("🛍️ Retiradas de Itens Comprados")
+
+    aba_nova, aba_gerenciar, aba_hist_retiradas = st.tabs([
+        "➕ Cadastrar Retirada",
+        "📋 Retiradas Pendentes",
+        "📚 Histórico de Retiradas Concluídas"
+    ])
+
+    with aba_nova:
+        st.subheader("Nova Retirada Presencial")
+        with st.form("form_nova_retirada", clear_on_submit=True):
+            nome_cli = st.text_input("Nome do Cliente *", placeholder="Ex.: Maria Souza")
+            itens_ret = st.text_area("Item / Itens a retirar *", placeholder="Ex.: Panela de Pressão Electrolux + Conjunto de Copos")
+            obs_ret = st.text_input("Observações (OBS)", placeholder="Ex.: Já pago via PIX / Retira no sábado à tarde")
+
+            salvar_ret = st.form_submit_button("Cadastrar Retirada", type="primary")
+
+            if salvar_ret:
+                if not nome_cli.strip():
+                    st.error("Informe o nome do cliente.")
+                elif not itens_ret.strip():
+                    st.error("Informe pelo menos um item para retirada.")
+                else:
+                    criar_retirada(nome_cli, itens_ret, obs_ret)
+                    st.success("Retirada cadastrada com sucesso!")
+                    st.rerun()
+
+    with aba_gerenciar:
+        st.subheader("Retiradas Aguardando Busca")
+        busca_ret = st.text_input("Buscar por cliente ou item", key="busca_ret_pendente")
+
+        retiradas_pendentes = listar_retiradas(status="Pendente")
+
+        if busca_ret.strip():
+            b_lower = busca_ret.strip().lower()
+            retiradas_pendentes = [
+                r for r in retiradas_pendentes
+                if b_lower in r["nome_cliente"].lower() or b_lower in r["itens"].lower()
+            ]
+
+        if not retiradas_pendentes:
+            st.info("Nenhuma retirada pendente encontrada.")
+        else:
+            for r in retiradas_pendentes:
+                with st.container(border=True):
+                    col_det, col_act = st.columns([4, 2])
+
+                    with col_det:
+                        st.markdown(f"### 👤 {r['nome_cliente']}")
+                        st.markdown(f"📦 **Itens:** {r['itens']}")
+                        if r["observacoes"]:
+                            st.caption(f"📝 **OBS:** {r['observacoes']}")
+                        st.caption(f"📅 Cadastrado em: {r['data_registro']}")
+
+                    with col_act:
+                        if st.button("✅ Confirmar Retirado", key=f"concluir_ret_{r['id']}", type="primary"):
+                            concluir_retirada(r["id"])
+                            st.success("Retirada concluída e salva no histórico!")
+                            st.rerun()
+
+                        col_btn1, col_btn2 = st.columns(2)
+                        with col_btn1:
+                            if st.button("✏️ Editar", key=f"edit_ret_btn_{r['id']}"):
+                                st.session_state[f"editando_ret_{r['id']}"] = True
+
+                        with col_btn2:
+                            if st.button("🗑️ Excluir", key=f"del_ret_btn_{r['id']}"):
+                                st.session_state[f"confirm_del_ret_{r['id']}"] = True
+
+                    if st.session_state.get(f"editando_ret_{r['id']}", False):
+                        st.divider()
+                        with st.form(f"form_edit_ret_{r['id']}"):
+                            novo_nome_r = st.text_input("Nome", value=r["nome_cliente"])
+                            novos_itens_r = st.text_area("Itens", value=r["itens"])
+                            novas_obs_r = st.text_input("OBS", value=r["observacoes"] or "")
+
+                            c_save, c_canc = st.columns(2)
+                            with c_save:
+                                b_salvar = st.form_submit_button("Salvar alterações", type="primary")
+                            with c_canc:
+                                b_canc = st.form_submit_button("Cancelar")
+
+                            if b_salvar:
+                                if not novo_nome_r.strip() or not novos_itens_r.strip():
+                                    st.error("Preencha o nome e os itens.")
+                                else:
+                                    atualizar_retirada(r["id"], novo_nome_r, novos_itens_r, novas_obs_r)
+                                    st.session_state[f"editando_ret_{r['id']}"] = False
+                                    st.success("Retirada atualizada!")
+                                    st.rerun()
+
+                            if b_canc:
+                                st.session_state[f"editando_ret_{r['id']}"] = False
+                                st.rerun()
+
+                    if st.session_state.get(f"confirm_del_ret_{r['id']}", False):
+                        st.warning(f"Tem certeza que deseja excluir a retirada de **{r['nome_cliente']}**?")
+                        cs, cn = st.columns(2)
+                        with cs:
+                            if st.button("Sim, excluir", key=f"conf_del_r_{r['id']}", type="primary"):
+                                excluir_retirada(r["id"])
+                                st.session_state[f"confirm_del_ret_{r['id']}"] = False
+                                st.success("Retirada excluída!")
+                                st.rerun()
+                        with cn:
+                            if st.button("Cancelar", key=f"canc_del_r_{r['id']}"):
+                                st.session_state[f"confirm_del_ret_{r['id']}"] = False
+                                st.rerun()
+
+    with aba_hist_retiradas:
+        st.subheader("Histórico de Itens Já Retirados")
+        retiradas_concluidas = listar_retiradas(status="Concluída")
+
+        if not retiradas_concluidas:
+            st.info("Nenhuma retirada foi concluída ainda.")
+        else:
+            dados_hist = []
+            for r in retiradas_concluidas:
+                dados_hist.append({
+                    "ID": r["id"],
+                    "Cliente": r["nome_cliente"],
+                    "Itens": r["itens"],
+                    "Observações": r["observacoes"] or "-",
+                    "Data do Cadastro": r["data_registro"],
+                    "Data da Retirada": r["data_conclusao"]
+                })
+
+            df_hist = pd.DataFrame(dados_hist)
+            st.dataframe(df_hist, use_container_width=True, hide_index=True)
+
+            csv_ret = df_hist.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "📥 Exportar Histórico de Retiradas (CSV)",
+                data=csv_ret,
+                file_name="historico_retiradas.csv",
+                mime="text/csv"
+            )
+
+
+# --------------------------------------------------
 # ETIQUETAS E HISTÓRICO
 # --------------------------------------------------
 
@@ -798,19 +1026,19 @@ elif pagina == "Etiquetas e Histórico":
         if not pedidos:
             st.info("Nenhum pedido encontrado para esta data.")
         else:
-            st.success(f"Encontrados {len(pedidos)} pedido(s) para {formatar_data(str(data_entrega))}.")
+            st.success(f"Encontrados {len(pedidos)} pedido(s) para a entrega de {formatar_data(str(data_entrega))}.")
             
-            # Pré-visualização das etiquetas
-            st.subheader("Pré-visualização das etiquetas:")
+            st.subheader("Pré-visualização do formato das etiquetas:")
             for p in pedidos:
                 itens = obter_itens(p["id"])
                 itens_txt = " + ".join([i['produto'] for i in itens])
-                obs_txt = f" | Obs: {p['observacoes']}" if p['observacoes'] else ""
+                info_obs = p['local_entrega'] + (f" ({p['observacoes']})" if p['observacoes'] else "")
+                
                 st.info(
-                    f"**De:** Sônia Vende Tudo  \n"
-                    f"**Para:** {p['cliente']}  \n"
-                    f"**Local:** {p['local_entrega']}{obs_txt}  \n"
-                    f"**Itens:** {itens_txt}"
+                    f"**De: Sônia Vende Tudo**  \n"
+                    f"**Para: {p['cliente']}**  \n"
+                    f"{itens_txt}  \n"
+                    f"*Obs:* {info_obs}"
                 )
 
             pdf_bytes = gerar_pdf_etiquetas(pedidos)
@@ -818,7 +1046,7 @@ elif pagina == "Etiquetas e Histórico":
             col1, col2 = st.columns(2)
             with col1:
                 if st.download_button(
-                    label="📄 Baixar PDF das Etiquetas",
+                    label="📄 Baixar PDF com Todas as Etiquetas (Folha A4)",
                     data=pdf_bytes,
                     file_name=f"etiquetas_{data_entrega}.pdf",
                     mime="application/pdf",
