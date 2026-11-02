@@ -1,9 +1,17 @@
+import io
 import sqlite3
-from datetime import date, timedelta
+from datetime import datetime, date, timedelta
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+
+# ReportLab para geração das etiquetas em PDF
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import cm
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
 # --------------------------------------------------
 # CONFIGURAÇÃO
@@ -45,7 +53,7 @@ def inicializar_banco():
                 cliente_id INTEGER NOT NULL,
                 data_pedido TEXT NOT NULL,
                 data_entrega TEXT NOT NULL,
-                tipo_entrega TEXT NOT NULL,
+                tipo_entrega TEXT NOT NULL DEFAULT 'Entrega',
                 local_entrega TEXT NOT NULL,
                 observacoes TEXT DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'Pendente',
@@ -62,6 +70,14 @@ def inicializar_banco():
                 separado INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (pedido_id)
                     REFERENCES pedidos(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS historico_etiquetas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                data_geracao TEXT NOT NULL,
+                data_filtro_entrega TEXT NOT NULL,
+                total_pedidos INTEGER NOT NULL,
+                detalhes_pedidos TEXT NOT NULL
             );
 
             CREATE INDEX IF NOT EXISTS idx_pedidos_data
@@ -193,11 +209,101 @@ def formatar_data(valor):
     return date.fromisoformat(valor).strftime("%d/%m/%Y")
 
 
+def salvar_historico_etiquetas(data_entrega, pedidos):
+    agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    resumo_list = []
+    for p in pedidos:
+        itens = obter_itens(p["id"])
+        itens_txt = " + ".join([f"{i['produto']}" for i in itens])
+        resumo_list.append(f"Pedido #{p['id']} - Para: {p['cliente']} | Itens: {itens_txt}")
+    
+    detalhes = "\n".join(resumo_list)
+    with conectar() as con:
+        con.execute("""
+            INSERT INTO historico_etiquetas (data_geracao, data_filtro_entrega, total_pedidos, detalhes_pedidos)
+            VALUES (?, ?, ?, ?)
+        """, (agora, str(data_entrega), len(pedidos), detalhes))
+
+
+def listar_historico_etiquetas():
+    with conectar() as con:
+        return con.execute("""
+            SELECT * FROM historico_etiquetas ORDER BY id DESC
+        """).fetchall()
+
+
+# --------------------------------------------------
+# GERADOR DE ETIQUETAS EM PDF (REPORTLAB)
+# --------------------------------------------------
+
+def gerar_pdf_etiquetas(pedidos):
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        leftMargin=1 * cm,
+        rightMargin=1 * cm,
+        topMargin=1 * cm,
+        bottomMargin=1 * cm
+    )
+
+    styles = getSampleStyleSheet()
+    
+    style_de = ParagraphStyle('EtiquetaDe', parent=styles['Normal'], fontSize=11, leading=14, fontName='Helvetica-Bold', textColor=colors.HexColor('#555555'))
+    style_para = ParagraphStyle('EtiquetaPara', parent=styles['Normal'], fontSize=12, leading=15, fontName='Helvetica-Bold', textColor=colors.HexColor('#000000'))
+    style_local = ParagraphStyle('EtiquetaLocal', parent=styles['Normal'], fontSize=10, leading=13, fontName='Helvetica-Oblique', textColor=colors.HexColor('#333333'))
+    style_itens = ParagraphStyle('EtiquetaItens', parent=styles['Normal'], fontSize=10, leading=13, fontName='Helvetica', textColor=colors.HexColor('#111111'))
+
+    cards = []
+
+    for p in pedidos:
+        itens = obter_itens(p["id"])
+        itens_txt = " + ".join([i['produto'] for i in itens])
+        
+        obs_txt = f"<br/><b>Obs:</b> {p['observacoes']}" if p['observacoes'] else ""
+        local_txt = f"<b>Local:</b> {p['local_entrega']}{obs_txt}"
+
+        conteudo = [
+            Paragraph(f"<b>De:</b> Sônia Vende Tudo", style_de),
+            Paragraph(f"<b>Para:</b> {p['cliente']}", style_para),
+            Paragraph(local_txt, style_local),
+            Paragraph(f"<b>Itens:</b> {itens_txt}", style_itens)
+        ]
+
+        t_card = Table([[c] for c in conteudo], colWidths=[8.8 * cm])
+        t_card.setStyle(TableStyle([
+            ('BOX', (0,0), (-1,-1), 1, colors.HexColor('#A0A0A0')),
+            ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#FAFAFA')),
+            ('TOPPADDING', (0,0), (-1,-1), 6),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 6),
+            ('LEFTPADDING', (0,0), (-1,-1), 8),
+            ('RIGHTPADDING', (0,0), (-1,-1), 8),
+        ]))
+        cards.append(t_card)
+
+    rows = []
+    for i in range(0, len(cards), 2):
+        if i + 1 < len(cards):
+            rows.append([cards[i], cards[i+1]])
+        else:
+            rows.append([cards[i], ""])
+
+    grid = Table(rows, colWidths=[9.3 * cm, 9.3 * cm])
+    grid.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+        ('LEFTPADDING', (0, 0), (-1, -1), 4),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 4),
+    ]))
+
+    doc.build([grid])
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 # --------------------------------------------------
 # MENU
 # --------------------------------------------------
-
-st.sidebar.title("📦 Minha Loja")
 
 pagina = st.sidebar.radio(
     "Menu principal",
@@ -208,7 +314,8 @@ pagina = st.sidebar.radio(
         "Gerenciar pedidos",
         "Separação",
         "Entregas de sábado",
-        "Histórico"
+        "Etiquetas e Histórico",
+        "Histórico Geral"
     ]
 )
 
@@ -274,7 +381,6 @@ if pagina == "Painel inicial":
 elif pagina == "Clientes":
     st.title("👥 Cadastro de clientes")
 
-    # Formulário de novo cliente
     with st.form("form_cliente", clear_on_submit=True):
         nome = st.text_input("Nome do cliente *")
         telefone = st.text_input("Telefone ou WhatsApp")
@@ -325,7 +431,6 @@ elif pagina == "Clientes":
                     if st.button("🗑️ Excluir", key=f"excluir_cli_{c['id']}"):
                         st.session_state[f"confirmar_exclusao_cli_{c['id']}"] = True
 
-                # Formulário de edição
                 if st.session_state.get(f"editando_cliente_{c['id']}", False):
                     with st.form(f"form_editar_cli_{c['id']}"):
                         novo_nome = st.text_input("Nome", value=c["nome"])
@@ -361,7 +466,6 @@ elif pagina == "Clientes":
                             st.session_state[f"editando_cliente_{c['id']}"] = False
                             st.rerun()
 
-                # Confirmação de exclusão
                 if st.session_state.get(f"confirmar_exclusao_cli_{c['id']}", False):
                     if cliente_tem_pedidos(c["id"]):
                         st.error(
@@ -405,11 +509,6 @@ elif pagina == "Novo pedido":
         for c in clientes
     }
 
-    st.caption(
-        "Adicione uma linha para cada produto. "
-        "Você pode incluir quantos itens precisar."
-    )
-
     with st.form("form_pedido"):
         cliente_escolhido = st.selectbox(
             "Cliente",
@@ -426,21 +525,14 @@ elif pagina == "Novo pedido":
             value=proximo_sabado()
         )
 
-        tipo_entrega = st.selectbox(
-            "Tipo de entrega",
-            [
-                "Estação de trem",
-                "Estação de metrô",
-                "Entrega pessoal"
-            ]
-        )
+        tipo_entrega = "Entrega"
 
         local_entrega = st.text_input(
-            "Local combinado",
-            placeholder="Ex.: Estação da Luz ou endereço combinado"
+            "Local de entrega / Endereço / Estação",
+            placeholder="Ex.: Estação Vila das Belezas ou Endereço residencial"
         )
 
-        observacoes = st.text_area("Observações do pedido")
+        observacoes = st.text_area("Observações do pedido (ex.: Entregar para fulano)")
 
         itens_df = pd.DataFrame([
             {"Produto": "", "Quantidade": 1.0, "Unidade": "un"}
@@ -452,21 +544,9 @@ elif pagina == "Novo pedido":
             use_container_width=True,
             hide_index=True,
             column_config={
-                "Produto": st.column_config.TextColumn(
-                    "Produto",
-                    required=True
-                ),
-                "Quantidade": st.column_config.NumberColumn(
-                    "Quantidade",
-                    min_value=0.01,
-                    step=1.0,
-                    required=True
-                ),
-                "Unidade": st.column_config.SelectboxColumn(
-                    "Unidade",
-                    options=["un", "pacote", "caixa", "kg", "g", "litro", "m"],
-                    required=True
-                )
+                "Produto": st.column_config.TextColumn("Produto", required=True),
+                "Quantidade": st.column_config.NumberColumn("Quantidade", min_value=0.01, step=1.0, required=True),
+                "Unidade": st.column_config.SelectboxColumn("Unidade", options=["un", "pacote", "caixa", "kg", "g", "litro", "m"], required=True)
             },
             key="tabela_itens_novo_pedido"
         )
@@ -475,24 +555,15 @@ elif pagina == "Novo pedido":
 
         if salvar_pedido:
             itens_validos = itens_editados.copy()
-            itens_validos["Produto"] = (
-                itens_validos["Produto"].fillna("").astype(str).str.strip()
-            )
-            itens_validos = itens_validos[
-                itens_validos["Produto"] != ""
-            ]
+            itens_validos["Produto"] = itens_validos["Produto"].fillna("").astype(str).str.strip()
+            itens_validos = itens_validos[itens_validos["Produto"] != ""]
 
             if not local_entrega.strip():
-                st.error("Informe o local combinado para a entrega.")
+                st.error("Informe o local de entrega.")
             elif data_entrega < data_pedido:
                 st.error("A entrega não pode ser anterior ao pedido.")
             elif itens_validos.empty:
                 st.error("Adicione pelo menos um produto.")
-            elif (
-                itens_validos["Quantidade"].isna().any()
-                or (itens_validos["Quantidade"] <= 0).any()
-            ):
-                st.error("Todas as quantidades devem ser maiores que zero.")
             else:
                 cliente_id = opcoes_clientes[cliente_escolhido]
 
@@ -530,7 +601,7 @@ elif pagina == "Novo pedido":
 
 
 # --------------------------------------------------
-# GERENCIAR PEDIDOS (EDIÇÃO E EXCLUSÃO)
+# GERENCIAR PEDIDOS
 # --------------------------------------------------
 
 elif pagina == "Gerenciar pedidos":
@@ -542,7 +613,6 @@ elif pagina == "Gerenciar pedidos":
         st.info("Nenhum pedido cadastrado.")
         st.stop()
 
-    # Filtros
     col_filtro1, col_filtro2 = st.columns(2)
     with col_filtro1:
         filtro_status = st.selectbox(
@@ -552,7 +622,6 @@ elif pagina == "Gerenciar pedidos":
     with col_filtro2:
         busca = st.text_input("Buscar por cliente ou nº do pedido")
 
-    # Aplicar filtros
     pedidos_filtrados = pedidos
     if filtro_status != "Todos":
         pedidos_filtrados = [p for p in pedidos_filtrados if p["status"] == filtro_status]
@@ -566,10 +635,8 @@ elif pagina == "Gerenciar pedidos":
         ]
 
     if not pedidos_filtrados:
-        st.info("Nenhum pedido encontrado com os filtros aplicados.")
+        st.info("Nenhum pedido encontrado.")
         st.stop()
-
-    st.caption(f"{len(pedidos_filtrados)} pedido(s) encontrado(s)")
 
     for p in pedidos_filtrados:
         with st.container(border=True):
@@ -580,7 +647,7 @@ elif pagina == "Gerenciar pedidos":
                     f"**Pedido #{p['id']}** — {p['cliente']}  \n"
                     f"📅 Entrega: {formatar_data(p['data_entrega'])} | "
                     f"Status: **{p['status']}**  \n"
-                    f"📍 {p['tipo_entrega']} — {p['local_entrega']}  \n"
+                    f"📍 Local: {p['local_entrega']}  \n"
                     f"Itens: {p['itens_separados']}/{p['total_itens']} separados"
                 )
 
@@ -592,7 +659,6 @@ elif pagina == "Gerenciar pedidos":
                 if st.button("🗑️ Excluir", key=f"excluir_ped_{p['id']}"):
                     st.session_state[f"confirmar_exclusao_ped_{p['id']}"] = True
 
-            # Confirmação de exclusão
             if st.session_state.get(f"confirmar_exclusao_ped_{p['id']}", False):
                 st.warning(f"Tem certeza que deseja excluir o **Pedido #{p['id']}** de **{p['cliente']}**?")
                 col_sim, col_nao = st.columns(2)
@@ -608,190 +674,6 @@ elif pagina == "Gerenciar pedidos":
                         st.session_state[f"confirmar_exclusao_ped_{p['id']}"] = False
                         st.rerun()
 
-    # ========== FORMULÁRIO DE EDIÇÃO DE PEDIDO ==========
-    if "pedido_editando" in st.session_state and st.session_state["pedido_editando"]:
-        pedido_id = st.session_state["pedido_editando"]
-        pedido = obter_pedido(pedido_id)
-
-        if not pedido:
-            st.error("Pedido não encontrado.")
-            del st.session_state["pedido_editando"]
-            st.stop()
-
-        st.divider()
-        st.subheader(f"✏️ Editando Pedido #{pedido_id}")
-
-        clientes = listar_clientes()
-        opcoes_clientes = {
-            f'{c["nome"]} (ID {c["id"]})': c["id"]
-            for c in clientes
-        }
-
-        # Encontrar o valor atual do cliente no selectbox
-        cliente_atual_label = next(
-            (label for label, cid in opcoes_clientes.items() if cid == pedido["cliente_id"]),
-            list(opcoes_clientes.keys())[0]
-        )
-
-        with st.form("form_editar_pedido"):
-            cliente_escolhido = st.selectbox(
-                "Cliente",
-                list(opcoes_clientes.keys()),
-                index=list(opcoes_clientes.keys()).index(cliente_atual_label)
-            )
-
-            data_pedido = st.date_input(
-                "Data do pedido",
-                value=date.fromisoformat(pedido["data_pedido"])
-            )
-
-            data_entrega = st.date_input(
-                "Data prevista da entrega",
-                value=date.fromisoformat(pedido["data_entrega"])
-            )
-
-            tipo_entrega = st.selectbox(
-                "Tipo de entrega",
-                [
-                    "Estação de trem",
-                    "Estação de metrô",
-                    "Entrega pessoal"
-                ],
-                index=[
-                    "Estação de trem",
-                    "Estação de metrô",
-                    "Entrega pessoal"
-                ].index(pedido["tipo_entrega"])
-                if pedido["tipo_entrega"] in [
-                    "Estação de trem",
-                    "Estação de metrô",
-                    "Entrega pessoal"
-                ] else 0
-            )
-
-            local_entrega = st.text_input(
-                "Local combinado",
-                value=pedido["local_entrega"]
-            )
-
-            observacoes = st.text_area(
-                "Observações do pedido",
-                value=pedido["observacoes"] or ""
-            )
-
-            # Itens atuais
-            itens_atuais = obter_itens(pedido_id)
-            if itens_atuais:
-                itens_df = pd.DataFrame([
-                    {
-                        "Produto": i["produto"],
-                        "Quantidade": i["quantidade"],
-                        "Unidade": i["unidade"]
-                    }
-                    for i in itens_atuais
-                ])
-            else:
-                itens_df = pd.DataFrame([
-                    {"Produto": "", "Quantidade": 1.0, "Unidade": "un"}
-                ])
-
-            st.markdown("**Itens do pedido**")
-            itens_editados = st.data_editor(
-                itens_df,
-                num_rows="dynamic",
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Produto": st.column_config.TextColumn("Produto", required=True),
-                    "Quantidade": st.column_config.NumberColumn(
-                        "Quantidade", min_value=0.01, step=1.0, required=True
-                    ),
-                    "Unidade": st.column_config.SelectboxColumn(
-                        "Unidade",
-                        options=["un", "pacote", "caixa", "kg", "g", "litro", "m"],
-                        required=True
-                    )
-                },
-                key=f"tabela_itens_editar_{pedido_id}"
-            )
-
-            col_salvar, col_cancelar = st.columns(2)
-            with col_salvar:
-                salvar = st.form_submit_button("Salvar alterações", type="primary")
-            with col_cancelar:
-                cancelar = st.form_submit_button("Cancelar edição")
-
-            if cancelar:
-                del st.session_state["pedido_editando"]
-                st.rerun()
-
-            if salvar:
-                itens_validos = itens_editados.copy()
-                itens_validos["Produto"] = (
-                    itens_validos["Produto"].fillna("").astype(str).str.strip()
-                )
-                itens_validos = itens_validos[itens_validos["Produto"] != ""]
-
-                if not local_entrega.strip():
-                    st.error("Informe o local combinado.")
-                elif data_entrega < data_pedido:
-                    st.error("A entrega não pode ser anterior ao pedido.")
-                elif itens_validos.empty:
-                    st.error("Adicione pelo menos um produto.")
-                elif (
-                    itens_validos["Quantidade"].isna().any()
-                    or (itens_validos["Quantidade"] <= 0).any()
-                ):
-                    st.error("Todas as quantidades devem ser maiores que zero.")
-                else:
-                    cliente_id = opcoes_clientes[cliente_escolhido]
-
-                    with conectar() as con:
-                        # Atualiza o pedido
-                        con.execute("""
-                            UPDATE pedidos SET
-                                cliente_id = ?,
-                                data_pedido = ?,
-                                data_entrega = ?,
-                                tipo_entrega = ?,
-                                local_entrega = ?,
-                                observacoes = ?
-                            WHERE id = ?
-                        """, (
-                            cliente_id,
-                            str(data_pedido),
-                            str(data_entrega),
-                            tipo_entrega,
-                            local_entrega.strip(),
-                            observacoes.strip(),
-                            pedido_id
-                        ))
-
-                        # Remove itens antigos e insere os novos
-                        con.execute(
-                            "DELETE FROM itens_pedido WHERE pedido_id = ?",
-                            (pedido_id,)
-                        )
-
-                        for _, item in itens_validos.iterrows():
-                            con.execute("""
-                                INSERT INTO itens_pedido
-                                (pedido_id, produto, quantidade, unidade, separado)
-                                VALUES (?, ?, ?, ?, 0)
-                            """, (
-                                pedido_id,
-                                str(item["Produto"]).strip(),
-                                float(item["Quantidade"]),
-                                str(item["Unidade"])
-                            ))
-
-                    # Atualiza status após alteração dos itens
-                    atualizar_status_pedido(pedido_id)
-
-                    st.success(f"Pedido #{pedido_id} atualizado com sucesso!")
-                    del st.session_state["pedido_editando"]
-                    st.rerun()
-
 
 # --------------------------------------------------
 # SEPARAÇÃO
@@ -801,27 +683,19 @@ elif pagina == "Separação":
     st.title("✅ Checklist de separação")
     st.write("Marque os produtos conforme forem colocados na sacola.")
 
-    pedidos = [
-        p for p in listar_pedidos()
-        if p["status"] != "Entregue"
-    ]
+    pedidos = [p for p in listar_pedidos() if p["status"] != "Entregue"]
 
     if not pedidos:
         st.info("Não há pedidos pendentes de separação.")
         st.stop()
 
     opcoes = {
-        f'Pedido #{p["id"]} - {p["cliente"]} '
-        f'({p["itens_separados"]}/{p["total_itens"]} separados)': p["id"]
+        f'Pedido #{p["id"]} - {p["cliente"]} ({p["itens_separados"]}/{p["total_itens"]} separados)': p["id"]
         for p in pedidos
     }
 
-    pedido_label = st.selectbox(
-        "Selecione o pedido",
-        list(opcoes.keys())
-    )
+    pedido_label = st.selectbox("Selecione o pedido", list(opcoes.keys()))
     pedido_id = opcoes[pedido_label]
-
     pedido = next(p for p in pedidos if p["id"] == pedido_id)
 
     st.write(f'**Cliente:** {pedido["cliente"]}')
@@ -832,18 +706,14 @@ elif pagina == "Separação":
 
     with st.form(f"form_separacao_{pedido_id}"):
         marcacoes = {}
-
         for item in itens:
             marcacoes[item["id"]] = st.checkbox(
-                f'{item["produto"]} — {item["quantidade"]:g} '
-                f'{item["unidade"]}',
+                f'{item["produto"]} — {item["quantidade"]:g} {item["unidade"]}',
                 value=bool(item["separado"]),
                 key=f'separacao_{item["id"]}'
             )
 
-        salvar_separacao = st.form_submit_button(
-            "Salvar checklist"
-        )
+        salvar_separacao = st.form_submit_button("Salvar checklist")
 
         if salvar_separacao:
             with conectar() as con:
@@ -852,18 +722,14 @@ elif pagina == "Separação":
                         UPDATE itens_pedido
                         SET separado = ?
                         WHERE id = ? AND pedido_id = ?
-                    """, (
-                        int(separado), item_id, pedido_id
-                    ))
+                    """, (int(separado), item_id, pedido_id))
 
             atualizar_status_pedido(pedido_id)
             st.success("Checklist de separação atualizado.")
             st.rerun()
 
     separados = sum(item["separado"] for item in itens)
-
     st.progress(separados / len(itens) if itens else 0)
-    st.caption(f"{separados} de {len(itens)} itens separados.")
 
 
 # --------------------------------------------------
@@ -879,23 +745,7 @@ elif pagina == "Entregas de sábado":
         key="data_checklist_entregas"
     )
 
-    tipo_filtro = st.selectbox(
-        "Filtrar por tipo de entrega",
-        [
-            "Todos",
-            "Estação de trem",
-            "Estação de metrô",
-            "Entrega pessoal"
-        ]
-    )
-
     pedidos = listar_pedidos(data_filtro=data_entrega)
-
-    if tipo_filtro != "Todos":
-        pedidos = [
-            p for p in pedidos
-            if p["tipo_entrega"] == tipo_filtro
-        ]
 
     if not pedidos:
         st.info("Nenhum pedido encontrado para essa data.")
@@ -904,84 +754,105 @@ elif pagina == "Entregas de sábado":
     for p in pedidos:
         with st.container(border=True):
             st.subheader(f'Pedido #{p["id"]} — {p["cliente"]}')
-            st.write(f'**Tipo:** {p["tipo_entrega"]}')
             st.write(f'**Local:** {p["local_entrega"]}')
-            st.write(
-                f'**Separação:** {p["itens_separados"]}/'
-                f'{p["total_itens"]} itens'
-            )
+            st.write(f'**Separação:** {p["itens_separados"]}/{p["total_itens"]} itens')
 
             if p["status"] == "Entregue":
-                st.success(
-                    f'Entregue em {formatar_data(p["data_conclusao"])}'
-                )
-
+                st.success(f'Entregue em {formatar_data(p["data_conclusao"])}')
             elif p["status"] != "Pronto para entrega":
                 st.warning("Pedido ainda não está totalmente separado.")
-
             else:
                 st.info("Pedido pronto para entrega.")
 
             with st.expander("Conferir produtos"):
                 for item in obter_itens(p["id"]):
                     marca = "✅" if item["separado"] else "⬜"
-                    st.write(
-                        f'{marca} {item["produto"]} — '
-                        f'{item["quantidade"]:g} {item["unidade"]}'
-                    )
+                    st.write(f'{marca} {item["produto"]} — {item["quantidade"]:g} {item["unidade"]}')
 
             if p["status"] == "Pronto para entrega":
-                if st.button(
-                    "Confirmar pedido entregue",
-                    key=f'entregue_{p["id"]}',
-                    type="primary"
-                ):
+                if st.button("Confirmar pedido entregue", key=f'entregue_{p["id"]}', type="primary"):
                     agora = date.today().isoformat()
-
                     with conectar() as con:
                         con.execute("""
                             UPDATE pedidos
-                            SET status = 'Entregue',
-                                data_conclusao = ?
-                            WHERE id = ?
-                              AND status = 'Pronto para entrega'
+                            SET status = 'Entregue', data_conclusao = ?
+                            WHERE id = ? AND status = 'Pronto para entrega'
                         """, (agora, p["id"]))
-
                     st.success("Entrega registrada!")
                     st.rerun()
 
 
 # --------------------------------------------------
-# HISTÓRICO
+# ETIQUETAS E HISTÓRICO
 # --------------------------------------------------
 
-elif pagina == "Histórico":
-    st.title("📚 Histórico de pedidos e entregas")
+elif pagina == "Etiquetas e Histórico":
+    st.title("🏷️ Etiquetas de Entrega")
+
+    aba_gerar, aba_historico = st.tabs(["📄 Gerar Etiquetas Atuais", "📚 Histórico de Etiquetas"])
+
+    with aba_gerar:
+        data_entrega = st.date_input("Selecione a data de entrega", value=proximo_sabado(), key="dt_etiq")
+        pedidos = listar_pedidos(data_filtro=data_entrega)
+
+        if not pedidos:
+            st.info("Nenhum pedido encontrado para esta data.")
+        else:
+            st.success(f"Encontrados {len(pedidos)} pedido(s) para {formatar_data(str(data_entrega))}.")
+            
+            # Pré-visualização das etiquetas
+            st.subheader("Pré-visualização das etiquetas:")
+            for p in pedidos:
+                itens = obter_itens(p["id"])
+                itens_txt = " + ".join([i['produto'] for i in itens])
+                obs_txt = f" | Obs: {p['observacoes']}" if p['observacoes'] else ""
+                st.info(
+                    f"**De:** Sônia Vende Tudo  \n"
+                    f"**Para:** {p['cliente']}  \n"
+                    f"**Local:** {p['local_entrega']}{obs_txt}  \n"
+                    f"**Itens:** {itens_txt}"
+                )
+
+            pdf_bytes = gerar_pdf_etiquetas(pedidos)
+
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.download_button(
+                    label="📄 Baixar PDF das Etiquetas",
+                    data=pdf_bytes,
+                    file_name=f"etiquetas_{data_entrega}.pdf",
+                    mime="application/pdf",
+                    type="primary"
+                ):
+                    salvar_historico_etiquetas(data_entrega, pedidos)
+                    st.toast("Lote de etiquetas registrado no histórico!")
+
+    with aba_historico:
+        st.subheader("Histórico de PDFs / Lotes Gerados")
+        historico = listar_historico_etiquetas()
+
+        if not historico:
+            st.info("Nenhum histórico de etiquetas foi registrado ainda.")
+        else:
+            for h in historico:
+                with st.expander(f"Lote de {formatar_data(h['data_filtro_entrega'])} - Gerado em: {h['data_geracao']} ({h['total_pedidos']} pedidos)"):
+                    st.text(h['detalhes_pedidos'])
+
+
+# --------------------------------------------------
+# HISTÓRICO GERAL
+# --------------------------------------------------
+
+elif pagina == "Histórico Geral":
+    st.title("📚 Histórico geral de pedidos")
 
     col1, col2 = st.columns(2)
-
     with col1:
-        data_inicio = st.date_input(
-            "Data inicial",
-            value=date.today() - timedelta(days=30),
-            key="historico_inicio"
-        )
-
+        data_inicio = st.date_input("Data inicial", value=date.today() - timedelta(days=30), key="historico_inicio")
     with col2:
-        data_fim = st.date_input(
-            "Data final",
-            value=date.today(),
-            key="historico_fim"
-        )
+        data_fim = st.date_input("Data final", value=date.today(), key="historico_fim")
 
-    status_filtro = st.selectbox(
-        "Status do pedido",
-        ["Todos", "Pendente", "Pronto para entrega", "Entregue"]
-    )
-
-    if data_inicio > data_fim:
-        st.error("A data inicial deve ser anterior à data final.")
-        st.stop()
+    status_filtro = st.selectbox("Status do pedido", ["Todos", "Pendente", "Pronto para entrega", "Entregue"])
 
     todos = listar_pedidos()
     filtrados = [
@@ -992,62 +863,18 @@ elif pagina == "Histórico":
 
     if filtrados:
         dados = []
-
         for p in filtrados:
             dados.append({
                 "Pedido": p["id"],
                 "Cliente": p["cliente"],
                 "Telefone": p["telefone"],
                 "Data prevista": formatar_data(p["data_entrega"]),
-                "Tipo": p["tipo_entrega"],
                 "Local": p["local_entrega"],
-                "Itens separados": f'{p["itens_separados"]}/{p["total_itens"]}',
                 "Status": p["status"],
                 "Data de conclusão": formatar_data(p["data_conclusao"])
             })
 
         historico_df = pd.DataFrame(dados)
-
-        st.dataframe(
-            historico_df,
-            use_container_width=True,
-            hide_index=True
-        )
-
-        csv = historico_df.to_csv(index=False).encode("utf-8-sig")
-
-        st.download_button(
-            "Exportar histórico em CSV",
-            data=csv,
-            file_name=f"historico_{data_inicio}_{data_fim}.csv",
-            mime="text/csv"
-        )
-
-        st.subheader("Detalhes dos pedidos")
-
-        pedido_id = st.selectbox(
-            "Consultar itens de um pedido",
-            [p["id"] for p in filtrados],
-            format_func=lambda pid: next(
-                f'Pedido #{p["id"]} - {p["cliente"]}'
-                for p in filtrados if p["id"] == pid
-            )
-        )
-
-        pedido_itens = obter_itens(pedido_id)
-
-        st.dataframe(
-            pd.DataFrame([
-                {
-                    "Produto": i["produto"],
-                    "Quantidade": i["quantidade"],
-                    "Unidade": i["unidade"],
-                    "Separado": "Sim" if i["separado"] else "Não"
-                }
-                for i in pedido_itens
-            ]),
-            use_container_width=True,
-            hide_index=True
-        )
+        st.dataframe(historico_df, use_container_width=True, hide_index=True)
     else:
         st.info("Nenhum pedido encontrado nesse período.")
