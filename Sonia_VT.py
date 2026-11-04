@@ -48,6 +48,12 @@ def inicializar_banco():
                 observacoes TEXT DEFAULT ''
             );
 
+            CREATE TABLE IF NOT EXISTS estoque (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                produto TEXT NOT NULL UNIQUE,
+                quantidade REAL NOT NULL DEFAULT 0.0
+            );
+
             CREATE TABLE IF NOT EXISTS pedidos (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 cliente_id INTEGER NOT NULL,
@@ -102,7 +108,7 @@ inicializar_banco()
 
 
 # --------------------------------------------------
-# FUNÇÕES AUXILIARES DE PEDIDOS E CLIENTES
+# FUNÇÕES AUXILIARES DE ESTOQUE, CLIENTES E PEDIDOS
 # --------------------------------------------------
 
 def proximo_sabado():
@@ -113,17 +119,7 @@ def proximo_sabado():
 
 def listar_clientes():
     with conectar() as con:
-        return con.execute(
-            "SELECT * FROM clientes ORDER BY nome"
-        ).fetchall()
-
-
-def obter_cliente(cliente_id):
-    with conectar() as con:
-        return con.execute(
-            "SELECT * FROM clientes WHERE id = ?",
-            (cliente_id,)
-        ).fetchone()
+        return con.execute("SELECT * FROM clientes ORDER BY nome").fetchall()
 
 
 def cliente_tem_pedidos(cliente_id):
@@ -133,6 +129,42 @@ def cliente_tem_pedidos(cliente_id):
             (cliente_id,)
         ).fetchone()
         return resultado["total"] > 0
+
+
+def listar_estoque():
+    with conectar() as con:
+        return con.execute("SELECT * FROM estoque ORDER BY produto").fetchall()
+
+
+def cadastrar_item_estoque(produto, quantidade):
+    with conectar() as con:
+        con.execute("""
+            INSERT INTO estoque (produto, quantidade)
+            VALUES (?, ?)
+        """, (produto.strip(), float(quantidade)))
+
+
+def atualizar_item_estoque(item_id, produto, quantidade):
+    with conectar() as con:
+        con.execute("""
+            UPDATE estoque
+            SET produto = ?, quantidade = ?
+            WHERE id = ?
+        """, (produto.strip(), float(quantidade), item_id))
+
+
+def excluir_item_estoque(item_id):
+    with conectar() as con:
+        con.execute("DELETE FROM estoque WHERE id = ?", (item_id,))
+
+
+def baixar_estoque(produto, quantidade):
+    with conectar() as con:
+        con.execute("""
+            UPDATE estoque
+            SET quantidade = quantidade - ?
+            WHERE produto = ?
+        """, (float(quantidade), produto))
 
 
 def listar_pedidos(data_filtro=None, status=None):
@@ -196,7 +228,6 @@ def obter_itens(pedido_id):
 
 def atualizar_status_pedido(pedido_id):
     itens = obter_itens(pedido_id)
-
     if not itens:
         return
 
@@ -237,9 +268,7 @@ def salvar_historico_etiquetas(data_entrega, pedidos):
 
 def listar_historico_etiquetas():
     with conectar() as con:
-        return con.execute("""
-            SELECT * FROM historico_etiquetas ORDER BY id DESC
-        """).fetchall()
+        return con.execute("SELECT * FROM historico_etiquetas ORDER BY id DESC").fetchall()
 
 
 # --------------------------------------------------
@@ -369,10 +398,9 @@ pagina = st.sidebar.radio(
     [
         "Painel inicial",
         "Clientes",
-        "Novo pedido",
-        "Gerenciar pedidos",
-        "Separação",
-        "Entregas de sábado",
+        "Estoque",
+        "Pedidos",
+        "Checklist",
         "Retiradas",
         "Etiquetas e Histórico",
         "Histórico Geral"
@@ -380,7 +408,7 @@ pagina = st.sidebar.radio(
 )
 
 st.sidebar.divider()
-st.sidebar.caption("Sistema local com banco SQLite")
+
 
 
 # --------------------------------------------------
@@ -398,6 +426,7 @@ if pagina == "Painel inicial":
 
     pedidos = listar_pedidos()
     clientes = listar_clientes()
+    estoque = listar_estoque()
     retiradas_pendentes = listar_retiradas(status="Pendente")
 
     pendentes = [p for p in pedidos if p["status"] == "Pendente"]
@@ -406,10 +435,10 @@ if pagina == "Painel inicial":
 
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Clientes", len(clientes))
-    col2.metric("Pedidos pendentes", len(pendentes))
-    col3.metric("Prontos para entrega", len(prontos))
-    col4.metric("Pedidos entregues", len(entregues))
-    col5.metric("Retiradas pendentes", len(retiradas_pendentes))
+    col2.metric("Itens no Estoque", len(estoque))
+    col3.metric("Pedidos pendentes", len(pendentes))
+    col4.metric("Prontos p/ entrega", len(prontos))
+    col5.metric("Retiradas pend.", len(retiradas_pendentes))
 
     st.divider()
     st.subheader("📈 Quantidade de Itens Entregues por Data")
@@ -427,7 +456,6 @@ if pagina == "Painel inicial":
         df_agrupado = df_graf.groupby("Data", as_index=False)["Itens Entregues"].sum()
         df_agrupado = df_agrupado.sort_values("Data")
         df_agrupado.set_index("Data", inplace=True)
-
         st.line_chart(df_agrupado)
     else:
         st.info("Ainda não há registros de pedidos entregues com data de conclusão para exibir no gráfico.")
@@ -449,11 +477,7 @@ if pagina == "Painel inicial":
                 "Status": p["status"],
                 "Itens separados": f'{p["itens_separados"]}/{p["total_itens"]}'
             })
-        st.dataframe(
-            pd.DataFrame(dados),
-            use_container_width=True,
-            hide_index=True
-        )
+        st.dataframe(pd.DataFrame(dados), use_container_width=True, hide_index=True)
     else:
         st.info("Nenhum pedido cadastrado para essa data.")
 
@@ -477,20 +501,14 @@ elif pagina == "Clientes":
             else:
                 with conectar() as con:
                     con.execute("""
-                        INSERT INTO clientes
-                        (nome, telefone, observacoes)
+                        INSERT INTO clientes (nome, telefone, observacoes)
                         VALUES (?, ?, ?)
-                    """, (
-                        nome.strip(),
-                        telefone.strip(),
-                        observacoes.strip()
-                    ))
+                    """, (nome.strip(), telefone.strip(), observacoes.strip()))
                 st.success("Cliente cadastrado!")
                 st.rerun()
 
     st.divider()
     st.subheader("Clientes cadastrados")
-
     clientes = listar_clientes()
 
     if not clientes:
@@ -536,12 +554,7 @@ elif pagina == "Clientes":
                                         UPDATE clientes
                                         SET nome = ?, telefone = ?, observacoes = ?
                                         WHERE id = ?
-                                    """, (
-                                        novo_nome.strip(),
-                                        novo_telefone.strip(),
-                                        novas_obs.strip(),
-                                        c["id"]
-                                    ))
+                                    """, (novo_nome.strip(), novo_telefone.strip(), novas_obs.strip(), c["id"]))
                                 st.success("Cliente atualizado!")
                                 st.session_state[f"editando_cliente_{c['id']}"] = False
                                 st.rerun()
@@ -552,10 +565,7 @@ elif pagina == "Clientes":
 
                 if st.session_state.get(f"confirmar_exclusao_cli_{c['id']}", False):
                     if cliente_tem_pedidos(c["id"]):
-                        st.error(
-                            "Este cliente possui pedidos cadastrados. "
-                            "Exclua os pedidos primeiro ou altere o cliente nos pedidos."
-                        )
+                        st.error("Este cliente possui pedidos cadastrados. Exclua os pedidos primeiro.")
                         if st.button("Fechar", key=f"fechar_erro_cli_{c['id']}"):
                             st.session_state[f"confirmar_exclusao_cli_{c['id']}"] = False
                             st.rerun()
@@ -576,294 +586,395 @@ elif pagina == "Clientes":
 
 
 # --------------------------------------------------
-# NOVO PEDIDO
+# ESTOQUE (PÁGINA CRUD)
 # --------------------------------------------------
 
-elif pagina == "Novo pedido":
-    st.title("🛍️ Cadastrar pedido")
+elif pagina == "Estoque":
+    st.title("📦 Controle de Estoque")
 
-    clientes = listar_clientes()
+    aba_cad, aba_ger = st.tabs(["➕ Cadastrar Item", "📋 Gerenciar Estoque"])
 
-    if not clientes:
-        st.warning("Cadastre um cliente antes de criar um pedido.")
-        st.stop()
+    with aba_cad:
+        st.subheader("Adicionar Novo Item ao Estoque")
+        with st.form("form_novo_estoque", clear_on_submit=True):
+            nome_produto = st.text_input("Nome do Produto *", placeholder="Ex.: Panela de Pressão")
+            qtd_produto = st.number_input("Quantidade Inicial *", min_value=0.0, step=1.0, value=1.0)
+            
+            salvar_est = st.form_submit_button("Cadastrar no Estoque", type="primary")
 
-    opcoes_clientes = {
-        f'{c["nome"]} (ID {c["id"]})': c["id"]
-        for c in clientes
-    }
+            if salvar_est:
+                if not nome_produto.strip():
+                    st.error("Informe o nome do produto.")
+                else:
+                    try:
+                        cadastrar_item_estoque(nome_produto, qtd_produto)
+                        st.success(f"Item '{nome_produto}' cadastrado com sucesso!")
+                        st.rerun()
+                    except sqlite3.IntegrityError:
+                        st.error("Já existe um produto com este nome no estoque.")
 
-    with st.form("form_pedido"):
-        cliente_escolhido = st.selectbox(
-            "Cliente",
-            list(opcoes_clientes.keys())
-        )
+    with aba_ger:
+        st.subheader("Itens Cadastrados no Estoque")
+        busca_est = st.text_input("Buscar produto no estoque", key="busca_estoque_txt")
 
-        data_pedido = st.date_input(
-            "Data do pedido",
-            value=date.today()
-        )
+        lista_est = listar_estoque()
 
-        data_entrega = st.date_input(
-            "Data prevista da entrega",
-            value=proximo_sabado()
-        )
+        if busca_est.strip():
+            b_lower = busca_est.strip().lower()
+            lista_est = [e for e in lista_est if b_lower in e["produto"].lower()]
 
-        tipo_entrega = "Entrega"
+        if not lista_est:
+            st.info("Nenhum item encontrado no estoque.")
+        else:
+            for item in lista_est:
+                with st.container(border=True):
+                    c1, c2 = st.columns([4, 2])
+                    with c1:
+                        st.markdown(f"### 📦 {item['produto']}")
+                        st.write(f"**Quantidade disponível:** {item['quantidade']:g}")
 
-        local_entrega = st.text_input(
-            "Local de entrega / Estação / Endereço",
-            placeholder="Ex.: Estação Vila das Belezas ou Endereço"
-        )
+                    with c2:
+                        col_b1, col_b2 = st.columns(2)
+                        with col_b1:
+                            if st.button("✏️ Editar", key=f"edit_est_{item['id']}"):
+                                st.session_state[f"editando_est_{item['id']}"] = True
+                        with col_b2:
+                            if st.button("🗑️ Excluir", key=f"del_est_{item['id']}"):
+                                st.session_state[f"confirm_del_est_{item['id']}"] = True
 
-        observacoes = st.text_area("Observações (ex.: Entregar para fulano)")
+                    if st.session_state.get(f"editando_est_{item['id']}", False):
+                        st.divider()
+                        with st.form(f"form_edit_est_{item['id']}"):
+                            novo_nome = st.text_input("Produto", value=item["produto"])
+                            nova_qtd = st.number_input("Quantidade", value=float(item["quantidade"]), step=1.0)
 
-        itens_df = pd.DataFrame([
-            {"Produto": "", "Quantidade": 1.0, "Unidade": "un"}
-        ])
+                            cs1, cs2 = st.columns(2)
+                            with cs1:
+                                btn_salvar_est = st.form_submit_button("Salvar alterações", type="primary")
+                            with cs2:
+                                btn_canc_est = st.form_submit_button("Cancelar")
 
-        itens_editados = st.data_editor(
-            itens_df,
-            num_rows="dynamic",
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Produto": st.column_config.TextColumn("Produto", required=True),
-                "Quantidade": st.column_config.NumberColumn("Quantidade", min_value=0.01, step=1.0, required=True),
-                "Unidade": st.column_config.SelectboxColumn("Unidade", options=["un", "pacote", "caixa", "kg", "g", "litro", "m"], required=True)
-            },
-            key="tabela_itens_novo_pedido"
-        )
+                            if btn_salvar_est:
+                                if not novo_nome.strip():
+                                    st.error("O nome do produto é obrigatório.")
+                                else:
+                                    try:
+                                        atualizar_item_estoque(item["id"], novo_nome, nova_qtd)
+                                        st.session_state[f"editando_est_{item['id']}"] = False
+                                        st.success("Estoque atualizado!")
+                                        st.rerun()
+                                    except sqlite3.IntegrityError:
+                                        st.error("Já existe outro produto com este mesmo nome.")
 
-        salvar_pedido = st.form_submit_button("Salvar pedido")
+                            if btn_canc_est:
+                                st.session_state[f"editando_est_{item['id']}"] = False
+                                st.rerun()
 
-        if salvar_pedido:
-            itens_validos = itens_editados.copy()
-            itens_validos["Produto"] = itens_validos["Produto"].fillna("").astype(str).str.strip()
-            itens_validos = itens_validos[itens_validos["Produto"] != ""]
-
-            if not local_entrega.strip():
-                st.error("Informe o local de entrega.")
-            elif data_entrega < data_pedido:
-                st.error("A entrega não pode ser anterior ao pedido.")
-            elif itens_validos.empty:
-                st.error("Adicione pelo menos um produto.")
-            else:
-                cliente_id = opcoes_clientes[cliente_escolhido]
-
-                with conectar() as con:
-                    cursor = con.execute("""
-                        INSERT INTO pedidos (
-                            cliente_id, data_pedido, data_entrega,
-                            tipo_entrega, local_entrega, observacoes, status
-                        )
-                        VALUES (?, ?, ?, ?, ?, ?, 'Pendente')
-                    """, (
-                        cliente_id,
-                        str(data_pedido),
-                        str(data_entrega),
-                        tipo_entrega,
-                        local_entrega.strip(),
-                        observacoes.strip()
-                    ))
-
-                    pedido_id = cursor.lastrowid
-
-                    for _, item in itens_validos.iterrows():
-                        con.execute("""
-                            INSERT INTO itens_pedido
-                            (pedido_id, produto, quantidade, unidade)
-                            VALUES (?, ?, ?, ?)
-                        """, (
-                            pedido_id,
-                            str(item["Produto"]).strip(),
-                            float(item["Quantidade"]),
-                            str(item["Unidade"])
-                        ))
-
-                st.success(f"Pedido #{pedido_id} cadastrado com sucesso!")
+                    if st.session_state.get(f"confirm_del_est_{item['id']}", False):
+                        st.warning(f"Tem certeza que deseja excluir **{item['produto']}** do estoque?")
+                        c_sim, c_nao = st.columns(2)
+                        with c_sim:
+                            if st.button("Sim, excluir", key=f"conf_del_estoque_{item['id']}", type="primary"):
+                                excluir_item_estoque(item["id"])
+                                st.session_state[f"confirm_del_est_{item['id']}"] = False
+                                st.success("Item excluído do estoque!")
+                                st.rerun()
+                        with c_nao:
+                            if st.button("Cancelar", key=f"canc_del_estoque_{item['id']}"):
+                                st.session_state[f"confirm_del_est_{item['id']}"] = False
+                                st.rerun()
 
 
 # --------------------------------------------------
-# GERENCIAR PEDIDOS
+# PEDIDOS (NOVO PEDIDO & GERENCIAR PEDIDOS)
 # --------------------------------------------------
 
-elif pagina == "Gerenciar pedidos":
-    st.title("📋 Gerenciar pedidos")
+elif pagina == "Pedidos":
+    st.title("📦 Gerenciamento de Pedidos")
 
-    pedidos = listar_pedidos()
+    aba_novo, aba_gerenciar = st.tabs(["➕ Novo pedido", "📋 Gerenciar pedidos"])
 
-    if not pedidos:
-        st.info("Nenhum pedido cadastrado.")
-        st.stop()
+    with aba_novo:
+        clientes = listar_clientes()
+        estoque_atual = listar_estoque()
 
-    col_filtro1, col_filtro2 = st.columns(2)
-    with col_filtro1:
-        filtro_status = st.selectbox(
-            "Filtrar por status",
-            ["Todos", "Pendente", "Pronto para entrega", "Entregue"]
-        )
-    with col_filtro2:
-        busca = st.text_input("Buscar por cliente ou nº do pedido")
+        if not clientes:
+            st.warning("Cadastre um cliente antes de criar um pedido.")
+        elif not estoque_atual:
+            st.warning("Cadastre itens no **Estoque** antes de criar um pedido para poder selecioná-los.")
+        else:
+            opcoes_clientes = {
+                f'{c["nome"]} (ID {c["id"]})': c["id"]
+                for c in clientes
+            }
 
-    pedidos_filtrados = pedidos
-    if filtro_status != "Todos":
-        pedidos_filtrados = [p for p in pedidos_filtrados if p["status"] == filtro_status]
-
-    if busca.strip():
-        busca_lower = busca.strip().lower()
-        pedidos_filtrados = [
-            p for p in pedidos_filtrados
-            if busca_lower in p["cliente"].lower()
-            or busca_lower in str(p["id"])
-        ]
-
-    if not pedidos_filtrados:
-        st.info("Nenhum pedido encontrado.")
-        st.stop()
-
-    for p in pedidos_filtrados:
-        with st.container(border=True):
-            col_info, col_acoes = st.columns([5, 2])
-
-            with col_info:
-                st.markdown(
-                    f"**Pedido #{p['id']}** — {p['cliente']}  \n"
-                    f"📅 Entrega: {formatar_data(p['data_entrega'])} | "
-                    f"Status: **{p['status']}**  \n"
-                    f"📍 Local: {p['local_entrega']}  \n"
-                    f"Itens: {p['itens_separados']}/{p['total_itens']} separados"
+            with st.form("form_pedido"):
+                cliente_escolhido = st.selectbox(
+                    "Cliente",
+                    list(opcoes_clientes.keys())
                 )
 
-            with col_acoes:
-                if st.button("✏️ Editar", key=f"editar_ped_{p['id']}"):
-                    st.session_state["pedido_editando"] = p["id"]
-                    st.rerun()
+                data_pedido = st.date_input(
+                    "Data do pedido",
+                    value=date.today()
+                )
 
-                if st.button("🗑️ Excluir", key=f"excluir_ped_{p['id']}"):
-                    st.session_state[f"confirmar_exclusao_ped_{p['id']}"] = True
+                data_entrega = st.date_input(
+                    "Data prevista da entrega",
+                    value=proximo_sabado()
+                )
 
-            if st.session_state.get(f"confirmar_exclusao_ped_{p['id']}", False):
-                st.warning(f"Tem certeza que deseja excluir o **Pedido #{p['id']}** de **{p['cliente']}**?")
-                col_sim, col_nao = st.columns(2)
-                with col_sim:
-                    if st.button("Sim, excluir", key=f"confirma_exc_ped_{p['id']}", type="primary"):
+                local_entrega = st.text_input(
+                    "Local de entrega / Estação / Endereço",
+                    placeholder="Ex.: Estação Vila das Belezas ou Endereço"
+                )
+
+                observacoes = st.text_area("Observações (ex.: Entregar para fulano)")
+
+                st.markdown("### Selecione os produtos do estoque:")
+                
+                opcoes_produtos_estoque = [f"{e['produto']} (Disp: {e['quantidade']:g})" for e in estoque_atual]
+                
+                itens_df = pd.DataFrame([
+                    {"Produto": opcoes_produtos_estoque[0], "Quantidade": 1.0}
+                ])
+
+                itens_editados = st.data_editor(
+                    itens_df,
+                    num_rows="dynamic",
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Produto": st.column_config.SelectboxColumn(
+                            "Produto do Estoque",
+                            options=opcoes_produtos_estoque,
+                            required=True
+                        ),
+                        "Quantidade": st.column_config.NumberColumn(
+                            "Quantidade", min_value=0.01, step=1.0, required=True
+                        )
+                    },
+                    key="tabela_itens_novo_pedido"
+                )
+
+                salvar_pedido = st.form_submit_button("Salvar pedido e dar baixa no estoque")
+
+                if salvar_pedido:
+                    itens_validos = itens_editados.dropna(subset=["Produto"]).copy()
+                    
+                    if not local_entrega.strip():
+                        st.error("Informe o local de entrega.")
+                    elif data_entrega < data_pedido:
+                        st.error("A entrega não pode ser anterior ao pedido.")
+                    elif itens_validos.empty:
+                        st.error("Adicione pelo menos um produto.")
+                    else:
+                        cliente_id = opcoes_clientes[cliente_escolhido]
+
                         with conectar() as con:
-                            con.execute("DELETE FROM pedidos WHERE id = ?", (p["id"],))
-                        st.success(f"Pedido #{p['id']} excluído!")
-                        st.session_state[f"confirmar_exclusao_ped_{p['id']}"] = False
-                        st.rerun()
-                with col_nao:
-                    if st.button("Cancelar", key=f"cancela_exc_ped_{p['id']}"):
-                        st.session_state[f"confirmar_exclusao_ped_{p['id']}"] = False
-                        st.rerun()
+                            cursor = con.execute("""
+                                INSERT INTO pedidos (
+                                    cliente_id, data_pedido, data_entrega,
+                                    tipo_entrega, local_entrega, observacoes, status
+                                )
+                                VALUES (?, ?, ?, ?, ?, ?, 'Pendente')
+                            """, (
+                                cliente_id,
+                                str(data_pedido),
+                                str(data_entrega),
+                                "Entrega",
+                                local_entrega.strip(),
+                                observacoes.strip()
+                            ))
 
+                            pedido_id = cursor.lastrowid
 
-# --------------------------------------------------
-# SEPARAÇÃO
-# --------------------------------------------------
+                            for _, item in itens_validos.iterrows():
+                                prod_str = str(item["Produto"])
+                                nome_prod_limpo = prod_str.split(" (Disp:")[0].strip()
+                                qtd_pedida = float(item["Quantidade"])
 
-elif pagina == "Separação":
-    st.title("✅ Checklist de separação")
-    st.write("Marque os produtos conforme forem colocados na sacola.")
+                                con.execute("""
+                                    INSERT INTO itens_pedido
+                                    (pedido_id, produto, quantidade, unidade)
+                                    VALUES (?, ?, ?, 'un')
+                                """, (
+                                    pedido_id,
+                                    nome_prod_limpo,
+                                    qtd_pedida
+                                ))
 
-    pedidos = [p for p in listar_pedidos() if p["status"] != "Entregue"]
+                                baixar_estoque(nome_prod_limpo, qtd_pedida)
 
-    if not pedidos:
-        st.info("Não há pedidos pendentes de separação.")
-        st.stop()
+                        st.success(f"Pedido #{pedido_id} cadastrado e estoque atualizado com sucesso!")
 
-    opcoes = {
-        f'Pedido #{p["id"]} - {p["cliente"]} ({p["itens_separados"]}/{p["total_itens"]} separados)': p["id"]
-        for p in pedidos
-    }
+    with aba_gerenciar:
+        pedidos = listar_pedidos()
 
-    pedido_label = st.selectbox("Selecione o pedido", list(opcoes.keys()))
-    pedido_id = opcoes[pedido_label]
-    pedido = next(p for p in pedidos if p["id"] == pedido_id)
+        if not pedidos:
+            st.info("Nenhum pedido cadastrado.")
+        else:
+            col_filtro1, col_filtro2 = st.columns(2)
+            with col_filtro1:
+                filtro_status = st.selectbox(
+                    "Filtrar por status",
+                    ["Todos", "Pendente", "Pronto para entrega", "Entregue"],
+                    key="filtro_status_gerenciar"
+                )
+            with col_filtro2:
+                busca = st.text_input("Buscar por cliente ou nº do pedido", key="busca_gerenciar_pedido")
 
-    st.write(f'**Cliente:** {pedido["cliente"]}')
-    st.write(f'**Entrega:** {formatar_data(pedido["data_entrega"])}')
-    st.write(f'**Local:** {pedido["local_entrega"]}')
+            pedidos_filtrados = pedidos
+            if filtro_status != "Todos":
+                pedidos_filtrados = [p for p in pedidos_filtrados if p["status"] == filtro_status]
 
-    itens = obter_itens(pedido_id)
+            if busca.strip():
+                busca_lower = busca.strip().lower()
+                pedidos_filtrados = [
+                    p for p in pedidos_filtrados
+                    if busca_lower in p["cliente"].lower()
+                    or busca_lower in str(p["id"])
+                ]
 
-    with st.form(f"form_separacao_{pedido_id}"):
-        marcacoes = {}
-        for item in itens:
-            marcacoes[item["id"]] = st.checkbox(
-                f'{item["produto"]} — {item["quantidade"]:g} {item["unidade"]}',
-                value=bool(item["separado"]),
-                key=f'separacao_{item["id"]}'
-            )
-
-        salvar_separacao = st.form_submit_button("Salvar checklist")
-
-        if salvar_separacao:
-            with conectar() as con:
-                for item_id, separado in marcacoes.items():
-                    con.execute("""
-                        UPDATE itens_pedido
-                        SET separado = ?
-                        WHERE id = ? AND pedido_id = ?
-                    """, (int(separado), item_id, pedido_id))
-
-            atualizar_status_pedido(pedido_id)
-            st.success("Checklist de separação atualizado.")
-            st.rerun()
-
-    separados = sum(item["separado"] for item in itens)
-    st.progress(separados / len(itens) if itens else 0)
-
-
-# --------------------------------------------------
-# ENTREGAS DE SÁBADO
-# --------------------------------------------------
-
-elif pagina == "Entregas de sábado":
-    st.title("🚚 Checklist de entregas")
-
-    data_entrega = st.date_input(
-        "Data das entregas",
-        value=proximo_sabado(),
-        key="data_checklist_entregas"
-    )
-
-    pedidos = listar_pedidos(data_filtro=data_entrega)
-
-    if not pedidos:
-        st.info("Nenhum pedido encontrado para essa data.")
-        st.stop()
-
-    for p in pedidos:
-        with st.container(border=True):
-            st.subheader(f'Pedido #{p["id"]} — {p["cliente"]}')
-            st.write(f'**Local:** {p["local_entrega"]}')
-            st.write(f'**Separação:** {p["itens_separados"]}/{p["total_itens"]} itens')
-
-            if p["status"] == "Entregue":
-                st.success(f'Entregue em {formatar_data(p["data_conclusao"])}')
-            elif p["status"] != "Pronto para entrega":
-                st.warning("Pedido ainda não está totalmente separado.")
+            if not pedidos_filtrados:
+                st.info("Nenhum pedido encontrado.")
             else:
-                st.info("Pedido pronto para entrega.")
+                for p in pedidos_filtrados:
+                    with st.container(border=True):
+                        col_info, col_acoes = st.columns([5, 2])
 
-            with st.expander("Conferir produtos"):
-                for item in obter_itens(p["id"]):
-                    marca = "✅" if item["separado"] else "⬜"
-                    st.write(f'{marca} {item["produto"]} — {item["quantidade"]:g} {item["unidade"]}')
+                        with col_info:
+                            st.markdown(
+                                f"**Pedido #{p['id']}** — {p['cliente']}  \n"
+                                f"📅 Entrega: {formatar_data(p['data_entrega'])} | "
+                                f"Status: **{p['status']}**  \n"
+                                f"📍 Local: {p['local_entrega']}  \n"
+                                f"Itens: {p['itens_separados']}/{p['total_itens']} separados"
+                            )
 
-            if p["status"] == "Pronto para entrega":
-                if st.button("Confirmar pedido entregue", key=f'entregue_{p["id"]}', type="primary"):
-                    agora = date.today().isoformat()
+                        with col_acoes:
+                            if st.button("🗑️ Excluir", key=f"excluir_ped_{p['id']}"):
+                                st.session_state[f"confirmar_exclusao_ped_{p['id']}"] = True
+
+                        if st.session_state.get(f"confirmar_exclusao_ped_{p['id']}", False):
+                            st.warning(f"Tem certeza que deseja excluir o **Pedido #{p['id']}** de **{p['cliente']}**?")
+                            col_sim, col_nao = st.columns(2)
+                            with col_sim:
+                                if st.button("Sim, excluir", key=f"confirma_exc_ped_{p['id']}", type="primary"):
+                                    with conectar() as con:
+                                        con.execute("DELETE FROM pedidos WHERE id = ?", (p["id"],))
+                                    st.success(f"Pedido #{p['id']} excluído!")
+                                    st.session_state[f"confirmar_exclusao_ped_{p['id']}"] = False
+                                    st.rerun()
+                            with col_nao:
+                                if st.button("Cancelar", key=f"cancela_exc_ped_{p['id']}"):
+                                    st.session_state[f"confirmar_exclusao_ped_{p['id']}"] = False
+                                    st.rerun()
+
+
+# --------------------------------------------------
+# CHECKLIST (SEPARAÇÃO & ENTREGAS DE SÁBADO)
+# --------------------------------------------------
+
+elif pagina == "Checklist":
+    st.title("📋 Central de Checklists")
+
+    aba_separacao, aba_entregas = st.tabs(["✅ Separação", "🚚 Entregas de sábado"])
+
+    with aba_separacao:
+        st.subheader("Checklist de separação")
+        st.write("Marque os produtos conforme forem colocados na sacola.")
+
+        pedidos = [p for p in listar_pedidos() if p["status"] != "Entregue"]
+
+        if not pedidos:
+            st.info("Não há pedidos pendentes de separação.")
+        else:
+            opcoes = {
+                f'Pedido #{p["id"]} - {p["cliente"]} ({p["itens_separados"]}/{p["total_itens"]} separados)': p["id"]
+                for p in pedidos
+            }
+
+            pedido_label = st.selectbox("Selecione o pedido", list(opcoes.keys()), key="select_sep_pedido")
+            pedido_id = opcoes[pedido_label]
+            pedido = next(p for p in pedidos if p["id"] == pedido_id)
+
+            st.write(f'**Cliente:** {pedido["cliente"]}')
+            st.write(f'**Entrega:** {formatar_data(pedido["data_entrega"])}')
+            st.write(f'**Local:** {pedido["local_entrega"]}')
+
+            itens = obter_itens(pedido_id)
+
+            with st.form(f"form_separacao_{pedido_id}"):
+                marcacoes = {}
+                for item in itens:
+                    marcacoes[item["id"]] = st.checkbox(
+                        f'{item["produto"]} — {item["quantidade"]:g}',
+                        value=bool(item["separado"]),
+                        key=f'separacao_{item["id"]}'
+                    )
+
+                salvar_separacao = st.form_submit_button("Salvar checklist")
+
+                if salvar_separacao:
                     with conectar() as con:
-                        con.execute("""
-                            UPDATE pedidos
-                            SET status = 'Entregue', data_conclusao = ?
-                            WHERE id = ? AND status = 'Pronto para entrega'
-                        """, (agora, p["id"]))
-                    st.success("Entrega registrada!")
+                        for item_id, separado in marcacoes.items():
+                            con.execute("""
+                                UPDATE itens_pedido
+                                SET separado = ?
+                                WHERE id = ? AND pedido_id = ?
+                            """, (int(separado), item_id, pedido_id))
+
+                    atualizar_status_pedido(pedido_id)
+                    st.success("Checklist de separação atualizado.")
                     st.rerun()
+
+            separados = sum(item["separado"] for item in itens)
+            st.progress(separados / len(itens) if itens else 0)
+
+    with aba_entregas:
+        st.subheader("Checklist de entregas")
+
+        data_entrega = st.date_input(
+            "Data das entregas",
+            value=proximo_sabado(),
+            key="data_checklist_entregas"
+        )
+
+        pedidos_sab = listar_pedidos(data_filtro=data_entrega)
+
+        if not pedidos_sab:
+            st.info("Nenhum pedido encontrado para essa data.")
+        else:
+            for p in pedidos_sab:
+                with st.container(border=True):
+                    st.subheader(f'Pedido #{p["id"]} — {p["cliente"]}')
+                    st.write(f'**Local:** {p["local_entrega"]}')
+                    st.write(f'**Separação:** {p["itens_separados"]}/{p["total_itens"]} itens')
+
+                    if p["status"] == "Entregue":
+                        st.success(f'Entregue em {formatar_data(p["data_conclusao"])}')
+                    elif p["status"] != "Pronto para entrega":
+                        st.warning("Pedido ainda não está totalmente separado.")
+                    else:
+                        st.info("Pedido pronto para entrega.")
+
+                    with st.expander("Conferir produtos"):
+                        for item in obter_itens(p["id"]):
+                            marca = "✅" if item["separado"] else "⬜"
+                            st.write(f'{marca} {item["produto"]} — {item["quantidade"]:g}')
+
+                    if p["status"] == "Pronto para entrega":
+                        if st.button("Confirmar pedido entregue", key=f'entregue_{p["id"]}', type="primary"):
+                            agora = date.today().isoformat()
+                            with conectar() as con:
+                                con.execute("""
+                                    UPDATE pedidos
+                                    SET status = 'Entregue', data_conclusao = ?
+                                    WHERE id = ? AND status = 'Pronto para entrega'
+                                """, (agora, p["id"]))
+                            st.success("Entrega registrada!")
+                            st.rerun()
 
 
 # --------------------------------------------------
@@ -880,11 +991,11 @@ elif pagina == "Retiradas":
     ])
 
     with aba_nova:
-    
+        st.subheader("Nova Retirada Presencial")
         with st.form("form_nova_retirada", clear_on_submit=True):
-            nome_cli = st.text_input("Nome  *", placeholder="Ex.: Miguel")
-            itens_ret = st.text_area("Item / Itens a retirar *", placeholder="Ex.: Lote , Brinquedo")
-            obs_ret = st.text_input("Observações (OBS)", placeholder="Ex.: Retirar antes do meio-dia")
+            nome_cli = st.text_input("Nome do Cliente *", placeholder="Ex.: Maria Souza")
+            itens_ret = st.text_area("Item / Itens a retirar *", placeholder="Ex.: Panela de Pressão Electrolux + Conjunto de Copos")
+            obs_ret = st.text_input("Observações (OBS)", placeholder="Ex.: Já pago via PIX / Retira no sábado à tarde")
 
             salvar_ret = st.form_submit_button("Cadastrar Retirada", type="primary")
 
@@ -899,8 +1010,8 @@ elif pagina == "Retiradas":
                     st.rerun()
 
     with aba_gerenciar:
-
-        busca_ret = st.text_input("Buscar por Nome ou item", key="busca_ret_pendente")
+        st.subheader("Retiradas Aguardando Busca")
+        busca_ret = st.text_input("Buscar por cliente ou item", key="busca_ret_pendente")
 
         retiradas_pendentes = listar_retiradas(status="Pendente")
 
@@ -1056,6 +1167,7 @@ elif pagina == "Etiquetas e Histórico":
                     st.toast("Lote de etiquetas registrado no histórico!")
 
     with aba_historico:
+        st.subheader("Histórico de PDFs / Lotes Gerados")
         historico = listar_historico_etiquetas()
 
         if not historico:
