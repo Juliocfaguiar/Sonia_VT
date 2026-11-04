@@ -408,7 +408,7 @@ pagina = st.sidebar.radio(
 )
 
 st.sidebar.divider()
-
+st.sidebar.caption("Sistema local com banco SQLite")
 
 
 # --------------------------------------------------
@@ -477,7 +477,7 @@ if pagina == "Painel inicial":
                 "Status": p["status"],
                 "Itens separados": f'{p["itens_separados"]}/{p["total_itens"]}'
             })
-        st.dataframe(pd.DataFrame(dados), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(dados), width='stretch', hide_index=True)
     else:
         st.info("Nenhum pedido cadastrado para essa data.")
 
@@ -742,7 +742,7 @@ elif pagina == "Pedidos":
                 itens_editados = st.data_editor(
                     itens_df,
                     num_rows="dynamic",
-                    use_container_width=True,
+                    width='stretch',
                     hide_index=True,
                     column_config={
                         "Produto": st.column_config.SelectboxColumn(
@@ -1110,7 +1110,7 @@ elif pagina == "Retiradas":
                 })
 
             df_hist = pd.DataFrame(dados_hist)
-            st.dataframe(df_hist, use_container_width=True, hide_index=True)
+            st.dataframe(df_hist, width='stretch', hide_index=True)
 
             csv_ret = df_hist.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
@@ -1214,6 +1214,6 @@ elif pagina == "Histórico Geral":
             })
 
         historico_df = pd.DataFrame(dados)
-        st.dataframe(historico_df, use_container_width=True, hide_index=True)
+        st.dataframe(historico_df, width='stretch', hide_index=True)
     else:
         st.info("Nenhum pedido encontrado nesse período.")
