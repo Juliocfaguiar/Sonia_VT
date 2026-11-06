@@ -32,7 +32,7 @@ st.set_page_config(
 # --------------------------------------------------
 
 def conectar():
-    conexao = sqlite3.connect(BANCO, timeout=10)
+    conexao = sqlite3.connect(BANCO, timeout=20)
     conexao.row_factory = sqlite3.Row
     conexao.execute("PRAGMA foreign_keys = ON")
     return conexao
@@ -158,13 +158,21 @@ def excluir_item_estoque(item_id):
         con.execute("DELETE FROM estoque WHERE id = ?", (item_id,))
 
 
-def baixar_estoque(produto, quantidade):
-    with conectar() as con:
+def baixar_estoque(produto, quantidade, con=None):
+    if con:
         con.execute("""
             UPDATE estoque
             SET quantidade = quantidade - ?
             WHERE produto = ?
         """, (float(quantidade), produto))
+    else:
+        with conectar() as conexao:
+            conexao.execute("""
+                UPDATE estoque
+                SET quantidade = quantidade - ?
+                WHERE produto = ?
+            """, (float(quantidade), produto))
+            conexao.commit()
 
 
 def listar_pedidos(data_filtro=None, status=None):
@@ -336,7 +344,7 @@ def gerar_pdf_etiquetas(pedidos):
 
     styles = getSampleStyleSheet()
     
-    style_de = ParagraphStyle('EtiquetaDe', parent=styles['Normal'], fontSize=13, leading=16, fontName='Helvetica-Bold', textColor=colors.HexColor('#222222'))
+    style_de = ParagraphStyle('EtiquetaDe', parent=styles['Normal'], fontSize=22, leading=16, fontName='Helvetica-Bold', textColor=colors.HexColor('#222222'))
     style_para = ParagraphStyle('EtiquetaPara', parent=styles['Normal'], fontSize=15, leading=18, fontName='Helvetica-Bold', textColor=colors.HexColor('#000000'))
     style_itens = ParagraphStyle('EtiquetaItens', parent=styles['Normal'], fontSize=9.5, leading=12, fontName='Helvetica', textColor=colors.HexColor('#111111'))
     style_obs = ParagraphStyle('EtiquetaObs', parent=styles['Normal'], fontSize=9, leading=11, fontName='Helvetica-Oblique', textColor=colors.HexColor('#444444'))
@@ -477,7 +485,7 @@ if pagina == "Painel inicial":
                 "Status": p["status"],
                 "Itens separados": f'{p["itens_separados"]}/{p["total_itens"]}'
             })
-        st.dataframe(pd.DataFrame(dados), width='stretch', hide_index=True)
+        st.dataframe(pd.DataFrame(dados), hide_index=True)
     else:
         st.info("Nenhum pedido cadastrado para essa data.")
 
@@ -742,7 +750,6 @@ elif pagina == "Pedidos":
                 itens_editados = st.data_editor(
                     itens_df,
                     num_rows="dynamic",
-                    width='stretch',
                     hide_index=True,
                     column_config={
                         "Produto": st.column_config.SelectboxColumn(
@@ -771,42 +778,46 @@ elif pagina == "Pedidos":
                     else:
                         cliente_id = opcoes_clientes[cliente_escolhido]
 
-                        with conectar() as con:
-                            cursor = con.execute("""
-                                INSERT INTO pedidos (
-                                    cliente_id, data_pedido, data_entrega,
-                                    tipo_entrega, local_entrega, observacoes, status
-                                )
-                                VALUES (?, ?, ?, ?, ?, ?, 'Pendente')
-                            """, (
-                                cliente_id,
-                                str(data_pedido),
-                                str(data_entrega),
-                                "Entrega",
-                                local_entrega.strip(),
-                                observacoes.strip()
-                            ))
-
-                            pedido_id = cursor.lastrowid
-
-                            for _, item in itens_validos.iterrows():
-                                prod_str = str(item["Produto"])
-                                nome_prod_limpo = prod_str.split(" (Disp:")[0].strip()
-                                qtd_pedida = float(item["Quantidade"])
-
-                                con.execute("""
-                                    INSERT INTO itens_pedido
-                                    (pedido_id, produto, quantidade, unidade)
-                                    VALUES (?, ?, ?, 'un')
+                        try:
+                            with conectar() as con:
+                                cursor = con.execute("""
+                                    INSERT INTO pedidos (
+                                        cliente_id, data_pedido, data_entrega,
+                                        tipo_entrega, local_entrega, observacoes, status
+                                    )
+                                    VALUES (?, ?, ?, ?, ?, ?, 'Pendente')
                                 """, (
-                                    pedido_id,
-                                    nome_prod_limpo,
-                                    qtd_pedida
+                                    cliente_id,
+                                    str(data_pedido),
+                                    str(data_entrega),
+                                    "Entrega",
+                                    local_entrega.strip(),
+                                    observacoes.strip()
                                 ))
 
-                                baixar_estoque(nome_prod_limpo, qtd_pedida)
+                                pedido_id = cursor.lastrowid
 
-                        st.success(f"Pedido #{pedido_id} cadastrado e estoque atualizado com sucesso!")
+                                for _, item in itens_validos.iterrows():
+                                    prod_str = str(item["Produto"])
+                                    nome_prod_limpo = prod_str.split(" (Disp:")[0].strip()
+                                    qtd_pedida = float(item["Quantidade"])
+
+                                    con.execute("""
+                                        INSERT INTO itens_pedido
+                                        (pedido_id, produto, quantidade, unidade)
+                                        VALUES (?, ?, ?, 'un')
+                                    """, (
+                                        pedido_id,
+                                        nome_prod_limpo,
+                                        qtd_pedida
+                                    ))
+
+                                    baixar_estoque(nome_prod_limpo, qtd_pedida, con=con)
+
+                                con.commit()
+                            st.success(f"Pedido #{pedido_id} cadastrado e estoque atualizado com sucesso!")
+                        except Exception as e:
+                            st.error(f"Erro ao salvar pedido: {e}")
 
     with aba_gerenciar:
         pedidos = listar_pedidos()
@@ -1110,7 +1121,7 @@ elif pagina == "Retiradas":
                 })
 
             df_hist = pd.DataFrame(dados_hist)
-            st.dataframe(df_hist, width='stretch', hide_index=True)
+            st.dataframe(df_hist, hide_index=True)
 
             csv_ret = df_hist.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
@@ -1214,6 +1225,6 @@ elif pagina == "Histórico Geral":
             })
 
         historico_df = pd.DataFrame(dados)
-        st.dataframe(historico_df, width='stretch', hide_index=True)
+        st.dataframe(historico_df, hide_index=True)
     else:
         st.info("Nenhum pedido encontrado nesse período.")
