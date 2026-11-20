@@ -1,10 +1,12 @@
 import io
-import sqlite3
+import sqlite3  # usado apenas para manter o tratamento de duplicidade na interface
 from datetime import datetime, date, timedelta
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+import firebase_admin
+from firebase_admin import credentials, firestore
 
 # ReportLab para geração das etiquetas em PDF
 from reportlab.lib import colors
@@ -18,7 +20,7 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 # --------------------------------------------------
 
 PASTA = Path(__file__).resolve().parent
-BANCO = PASTA / "loja.db"
+
 
 st.set_page_config(
     page_title="Controle SoniaVT",
@@ -28,87 +30,191 @@ st.set_page_config(
 
 
 # --------------------------------------------------
-# BANCO DE DADOS
+# FIREBASE / CLOUD FIRESTORE
 # --------------------------------------------------
 
+@st.cache_resource
+def obter_banco():
+    """Inicializa o Firebase usando os Secrets do Streamlit Cloud."""
+    if not firebase_admin._apps:
+        if "firebase" not in st.secrets:
+            st.error("Configure os Secrets do Firebase no Streamlit Cloud antes de usar o aplicativo.")
+            st.stop()
+        dados_credencial = dict(st.secrets["firebase"])
+        cred = credentials.Certificate(dados_credencial)
+        firebase_admin.initialize_app(cred)
+    return firestore.client()
+
+
+db = obter_banco()
+
+
+class ResultadoFirestore:
+    def __init__(self, rows=None, lastrowid=None):
+        self.rows = rows or []
+        self.lastrowid = lastrowid
+
+    def fetchall(self):
+        return self.rows
+
+    def fetchone(self):
+        return self.rows[0] if self.rows else None
+
+
+class ConexaoFirestore:
+    """Adaptador pequeno para manter compatíveis as operações CRUD da interface existente."""
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def commit(self):
+        # As gravações do Firestore são persistidas imediatamente.
+        return None
+
+    def executescript(self, script):
+        # O Firestore não exige criação prévia de tabelas.
+        return None
+
+    def execute(self, sql, params=()):
+        q = " ".join(sql.lower().split())
+        p = tuple(params or ())
+
+        if q.startswith("insert into clientes"):
+            ref = db.collection("clientes").document()
+            ref.set({"nome": p[0], "telefone": p[1], "observacoes": p[2]})
+            return ResultadoFirestore(lastrowid=ref.id)
+
+        if q.startswith("update clientes"):
+            nome, telefone, obs, doc_id = p
+            db.collection("clientes").document(str(doc_id)).update({"nome": nome, "telefone": telefone, "observacoes": obs})
+            return ResultadoFirestore()
+
+        if q.startswith("delete from clientes"):
+            db.collection("clientes").document(str(p[0])).delete()
+            return ResultadoFirestore()
+
+        if q.startswith("insert into estoque"):
+            nome, qtd = p
+            existentes = list(db.collection("estoque").where("produto", "==", nome).limit(1).stream())
+            if existentes:
+                raise sqlite3.IntegrityError("Produto já cadastrado")
+            ref = db.collection("estoque").document()
+            ref.set({"produto": nome, "quantidade": float(qtd)})
+            return ResultadoFirestore(lastrowid=ref.id)
+
+        if q.startswith("update estoque"):
+            if "set produto = ?, quantidade = ?" in q:
+                nome, qtd, doc_id = p
+                existentes = list(db.collection("estoque").where("produto", "==", nome).stream())
+                if any(x.id != str(doc_id) for x in existentes):
+                    raise sqlite3.IntegrityError("Produto já cadastrado")
+                db.collection("estoque").document(str(doc_id)).update({"produto": nome, "quantidade": float(qtd)})
+            elif "set quantidade = quantidade - ?" in q:
+                qtd, nome = p
+                docs = list(db.collection("estoque").where("produto", "==", nome).limit(1).stream())
+                if not docs:
+                    raise ValueError(f"Produto não encontrado no estoque: {nome}")
+                ref = docs[0].reference
+                @firestore.transactional
+                def baixar(transaction):
+                    snap = ref.get(transaction=transaction)
+                    atual = float(snap.get("quantidade") or 0)
+                    if atual < float(qtd):
+                        raise ValueError(f"Estoque insuficiente para {nome}. Disponível: {atual:g}")
+                    transaction.update(ref, {"quantidade": atual - float(qtd)})
+                baixar(db.transaction())
+            return ResultadoFirestore()
+
+        if q.startswith("delete from estoque"):
+            db.collection("estoque").document(str(p[0])).delete()
+            return ResultadoFirestore()
+
+        if q.startswith("insert into pedidos"):
+            cliente_id, data_pedido, data_entrega, tipo, local, obs = p
+            ref = db.collection("pedidos").document()
+            ref.set({"cliente_id": str(cliente_id), "data_pedido": data_pedido, "data_entrega": data_entrega,
+                     "tipo_entrega": tipo, "local_entrega": local, "observacoes": obs,
+                     "status": "Pendente", "data_conclusao": None})
+            return ResultadoFirestore(lastrowid=ref.id)
+
+        if q.startswith("insert into itens_pedido"):
+            pedido_id, produto, quantidade = p
+            ref = db.collection("pedidos").document(str(pedido_id)).collection("itens").document()
+            ref.set({"produto": produto, "quantidade": float(quantidade), "unidade": "un", "separado": False})
+            return ResultadoFirestore(lastrowid=ref.id)
+
+        if q.startswith("update itens_pedido"):
+            separado, item_id, pedido_id = p
+            ref = db.collection("pedidos").document(str(pedido_id)).collection("itens").document(str(item_id))
+            ref.update({"separado": bool(separado)})
+            return ResultadoFirestore()
+
+        if q.startswith("delete from pedidos"):
+            ref = db.collection("pedidos").document(str(p[0]))
+            for item in ref.collection("itens").stream():
+                item.reference.delete()
+            ref.delete()
+            return ResultadoFirestore()
+
+        if q.startswith("update pedidos"):
+            if "set status = 'entregue'" in q:
+                data_conclusao, pedido_id = p
+                ref = db.collection("pedidos").document(str(pedido_id))
+                snap = ref.get()
+                if snap.exists and snap.get("status") == "Pronto para entrega":
+                    ref.update({"status": "Entregue", "data_conclusao": data_conclusao})
+            else:
+                status, data_conclusao, pedido_id = p
+                db.collection("pedidos").document(str(pedido_id)).update({"status": status, "data_conclusao": data_conclusao})
+            return ResultadoFirestore()
+
+        if q.startswith("insert into historico_etiquetas"):
+            data_geracao, data_filtro, total, detalhes = p
+            ref = db.collection("historico_etiquetas").document()
+            ref.set({"data_geracao": data_geracao, "data_filtro_entrega": data_filtro,
+                     "total_pedidos": int(total), "detalhes_pedidos": detalhes})
+            return ResultadoFirestore(lastrowid=ref.id)
+
+        if q.startswith("insert into retiradas"):
+            nome, itens, obs, data_registro = p
+            ref = db.collection("retiradas").document()
+            ref.set({"nome_cliente": nome, "itens": itens, "observacoes": obs,
+                     "data_registro": data_registro, "status": "Pendente", "data_conclusao": None})
+            return ResultadoFirestore(lastrowid=ref.id)
+
+        if q.startswith("update retiradas set nome_cliente"):
+            nome, itens, obs, retirada_id = p
+            db.collection("retiradas").document(str(retirada_id)).update({"nome_cliente": nome, "itens": itens, "observacoes": obs})
+            return ResultadoFirestore()
+
+        if q.startswith("update retiradas set status"):
+            data_conclusao, retirada_id = p
+            db.collection("retiradas").document(str(retirada_id)).update({"status": "Concluída", "data_conclusao": data_conclusao})
+            return ResultadoFirestore()
+
+        if q.startswith("delete from retiradas"):
+            db.collection("retiradas").document(str(p[0])).delete()
+            return ResultadoFirestore()
+
+        raise NotImplementedError(f"Operação SQL ainda não convertida para Firestore: {sql}")
+
+
 def conectar():
-    conexao = sqlite3.connect(BANCO, timeout=20)
-    conexao.row_factory = sqlite3.Row
-    conexao.execute("PRAGMA foreign_keys = ON")
-    return conexao
+    return ConexaoFirestore()
 
 
 def inicializar_banco():
-    with conectar() as con:
-        con.executescript("""
-            CREATE TABLE IF NOT EXISTS clientes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                nome TEXT NOT NULL,
-                telefone TEXT DEFAULT '',
-                observacoes TEXT DEFAULT ''
-            );
-
-            CREATE TABLE IF NOT EXISTS estoque (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                produto TEXT NOT NULL UNIQUE,
-                quantidade REAL NOT NULL DEFAULT 0.0
-            );
-
-            CREATE TABLE IF NOT EXISTS pedidos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                cliente_id INTEGER NOT NULL,
-                data_pedido TEXT NOT NULL,
-                data_entrega TEXT NOT NULL,
-                tipo_entrega TEXT NOT NULL DEFAULT 'Entrega',
-                local_entrega TEXT NOT NULL,
-                observacoes TEXT DEFAULT '',
-                status TEXT NOT NULL DEFAULT 'Pendente',
-                data_conclusao TEXT,
-                FOREIGN KEY (cliente_id) REFERENCES clientes(id)
-            );
-
-            CREATE TABLE IF NOT EXISTS itens_pedido (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                pedido_id INTEGER NOT NULL,
-                produto TEXT NOT NULL,
-                quantidade REAL NOT NULL,
-                unidade TEXT NOT NULL DEFAULT 'un',
-                separado INTEGER NOT NULL DEFAULT 0,
-                FOREIGN KEY (pedido_id)
-                    REFERENCES pedidos(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS historico_etiquetas (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                data_geracao TEXT NOT NULL,
-                data_filtro_entrega TEXT NOT NULL,
-                total_pedidos INTEGER NOT NULL,
-                detalhes_pedidos TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS retiradas (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                nome_cliente TEXT NOT NULL,
-                itens TEXT NOT NULL,
-                observacoes TEXT DEFAULT '',
-                data_registro TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'Pendente',
-                data_conclusao TEXT
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_pedidos_data
-            ON pedidos(data_entrega);
-
-            CREATE INDEX IF NOT EXISTS idx_itens_pedido
-            ON itens_pedido(pedido_id);
-        """)
+    # As coleções e documentos são criados automaticamente no primeiro cadastro.
+    return None
 
 
 inicializar_banco()
 
 
 # --------------------------------------------------
-# FUNÇÕES AUXILIARES DE ESTOQUE, CLIENTES E PEDIDOS
+# FUNÇÕES AUXILIARES - FIRESTORE
 # --------------------------------------------------
 
 def proximo_sabado():
@@ -117,214 +223,179 @@ def proximo_sabado():
     return hoje + timedelta(days=dias)
 
 
+def _docs(colecao):
+    return [{"id": d.id, **d.to_dict()} for d in db.collection(colecao).stream()]
+
+
 def listar_clientes():
-    with conectar() as con:
-        return con.execute("SELECT * FROM clientes ORDER BY nome").fetchall()
+    return sorted(_docs("clientes"), key=lambda x: x.get("nome", "").lower())
 
 
 def cliente_tem_pedidos(cliente_id):
-    with conectar() as con:
-        resultado = con.execute(
-            "SELECT COUNT(*) AS total FROM pedidos WHERE cliente_id = ?",
-            (cliente_id,)
-        ).fetchone()
-        return resultado["total"] > 0
+    return bool(list(db.collection("pedidos").where("cliente_id", "==", str(cliente_id)).limit(1).stream()))
 
 
 def listar_estoque():
-    with conectar() as con:
-        return con.execute("SELECT * FROM estoque ORDER BY produto").fetchall()
+    return sorted(_docs("estoque"), key=lambda x: x.get("produto", "").lower())
 
 
 def cadastrar_item_estoque(produto, quantidade):
-    with conectar() as con:
-        con.execute("""
-            INSERT INTO estoque (produto, quantidade)
-            VALUES (?, ?)
-        """, (produto.strip(), float(quantidade)))
+    nome = produto.strip()
+    if list(db.collection("estoque").where("produto", "==", nome).limit(1).stream()):
+        raise sqlite3.IntegrityError("Produto já cadastrado")
+    db.collection("estoque").document().set({"produto": nome, "quantidade": float(quantidade)})
 
 
 def atualizar_item_estoque(item_id, produto, quantidade):
-    with conectar() as con:
-        con.execute("""
-            UPDATE estoque
-            SET produto = ?, quantidade = ?
-            WHERE id = ?
-        """, (produto.strip(), float(quantidade), item_id))
+    nome = produto.strip()
+    existentes = list(db.collection("estoque").where("produto", "==", nome).stream())
+    if any(d.id != str(item_id) for d in existentes):
+        raise sqlite3.IntegrityError("Produto já cadastrado")
+    db.collection("estoque").document(str(item_id)).update({"produto": nome, "quantidade": float(quantidade)})
 
 
 def excluir_item_estoque(item_id):
-    with conectar() as con:
-        con.execute("DELETE FROM estoque WHERE id = ?", (item_id,))
+    db.collection("estoque").document(str(item_id)).delete()
 
 
 def baixar_estoque(produto, quantidade, con=None):
-    if con:
-        con.execute("""
-            UPDATE estoque
-            SET quantidade = quantidade - ?
-            WHERE produto = ?
-        """, (float(quantidade), produto))
-    else:
-        with conectar() as conexao:
-            conexao.execute("""
-                UPDATE estoque
-                SET quantidade = quantidade - ?
-                WHERE produto = ?
-            """, (float(quantidade), produto))
-            conexao.commit()
+    ConexaoFirestore().execute("UPDATE estoque SET quantidade = quantidade - ? WHERE produto = ?", (float(quantidade), produto))
+
+
+def criar_pedido_com_estoque(cliente_id, data_pedido, data_entrega, local_entrega, observacoes, itens):
+    """Cria o pedido e baixa todo o estoque em uma única transação Firestore."""
+    produtos = {}
+    for item in itens:
+        nome = item["produto"].strip()
+        encontrados = list(db.collection("estoque").where("produto", "==", nome).limit(1).stream())
+        if not encontrados:
+            raise ValueError(f"Produto não encontrado no estoque: {nome}")
+        produtos[nome] = encontrados[0].reference
+
+    pedido_ref = db.collection("pedidos").document()
+    itens_refs = [(pedido_ref.collection("itens").document(), item) for item in itens]
+    transaction = db.transaction()
+
+    @firestore.transactional
+    def executar(transaction):
+        snapshots = {nome: transaction.get(ref) for nome, ref in produtos.items()}
+        for item in itens:
+            nome = item["produto"].strip()
+            qtd = float(item["quantidade"])
+            snap = snapshots[nome]
+            if not snap.exists:
+                raise ValueError(f"Produto não encontrado no estoque: {nome}")
+            disponivel = float(snap.get("quantidade") or 0)
+            if qtd <= 0 or disponivel < qtd:
+                raise ValueError(f"Estoque insuficiente para {nome}. Disponível: {disponivel:g}; solicitado: {qtd:g}.")
+
+        transaction.set(pedido_ref, {
+            "cliente_id": str(cliente_id), "data_pedido": str(data_pedido),
+            "data_entrega": str(data_entrega), "tipo_entrega": "Entrega",
+            "local_entrega": local_entrega.strip(), "observacoes": observacoes.strip(),
+            "status": "Pendente", "data_conclusao": None
+        })
+        for item_ref, item in itens_refs:
+            transaction.set(item_ref, {"produto": item["produto"].strip(),
+                "quantidade": float(item["quantidade"]), "unidade": "un", "separado": False})
+        for nome, ref in produtos.items():
+            total = sum(float(i["quantidade"]) for i in itens if i["produto"].strip() == nome)
+            atual = float(snapshots[nome].get("quantidade") or 0)
+            transaction.update(ref, {"quantidade": atual - total})
+
+    executar(transaction)
+    return pedido_ref.id
 
 
 def listar_pedidos(data_filtro=None, status=None):
-    sql = """
-        SELECT
-            p.*,
-            c.nome AS cliente,
-            c.telefone AS telefone,
-            (
-                SELECT COUNT(*)
-                FROM itens_pedido i
-                WHERE i.pedido_id = p.id
-            ) AS total_itens,
-            (
-                SELECT COUNT(*)
-                FROM itens_pedido i
-                WHERE i.pedido_id = p.id AND i.separado = 1
-            ) AS itens_separados
-        FROM pedidos p
-        JOIN clientes c ON c.id = p.cliente_id
-        WHERE 1 = 1
-    """
-    parametros = []
-
-    if data_filtro:
-        sql += " AND p.data_entrega = ?"
-        parametros.append(str(data_filtro))
-
-    if status:
-        sql += " AND p.status = ?"
-        parametros.append(status)
-
-    sql += " ORDER BY p.data_entrega DESC, c.nome"
-
-    with conectar() as con:
-        return con.execute(sql, parametros).fetchall()
+    clientes = {c["id"]: c for c in listar_clientes()}
+    resultado = []
+    for pedido in _docs("pedidos"):
+        cliente = clientes.get(str(pedido.get("cliente_id")))
+        if not cliente:
+            continue
+        if data_filtro and pedido.get("data_entrega") != str(data_filtro):
+            continue
+        if status and pedido.get("status") != status:
+            continue
+        itens = obter_itens(pedido["id"])
+        pedido.update({"cliente": cliente.get("nome", ""), "telefone": cliente.get("telefone", ""),
+                       "total_itens": len(itens), "itens_separados": sum(bool(i.get("separado")) for i in itens)})
+        resultado.append(pedido)
+    return sorted(resultado, key=lambda x: (x.get("data_entrega", ""), x.get("cliente", "")), reverse=True)
 
 
 def obter_pedido(pedido_id):
-    with conectar() as con:
-        return con.execute("""
-            SELECT
-                p.*,
-                c.nome AS cliente,
-                c.telefone AS telefone
-            FROM pedidos p
-            JOIN clientes c ON c.id = p.cliente_id
-            WHERE p.id = ?
-        """, (pedido_id,)).fetchone()
+    snap = db.collection("pedidos").document(str(pedido_id)).get()
+    if not snap.exists:
+        return None
+    p = {"id": snap.id, **snap.to_dict()}
+    cliente = db.collection("clientes").document(str(p.get("cliente_id"))).get()
+    if cliente.exists:
+        p["cliente"] = cliente.get("nome")
+        p["telefone"] = cliente.get("telefone", "")
+    return p
 
 
 def obter_itens(pedido_id):
-    with conectar() as con:
-        return con.execute("""
-            SELECT *
-            FROM itens_pedido
-            WHERE pedido_id = ?
-            ORDER BY id
-        """, (pedido_id,)).fetchall()
+    return [{"id": d.id, **d.to_dict()} for d in db.collection("pedidos").document(str(pedido_id)).collection("itens").stream()]
 
 
 def atualizar_status_pedido(pedido_id):
     itens = obter_itens(pedido_id)
     if not itens:
         return
-
-    if all(item["separado"] for item in itens):
-        novo_status = "Pronto para entrega"
-    else:
-        novo_status = "Pendente"
-
-    with conectar() as con:
-        con.execute("""
-            UPDATE pedidos
-            SET status = ?
-            WHERE id = ? AND status != 'Entregue'
-        """, (novo_status, pedido_id))
+    pedido_ref = db.collection("pedidos").document(str(pedido_id))
+    pedido = pedido_ref.get()
+    if pedido.exists and pedido.get("status") != "Entregue":
+        pedido_ref.update({"status": "Pronto para entrega" if all(i.get("separado") for i in itens) else "Pendente"})
 
 
 def formatar_data(valor):
     if not valor:
         return "-"
-    return date.fromisoformat(valor).strftime("%d/%m/%Y")
+    return date.fromisoformat(str(valor)[:10]).strftime("%d/%m/%Y")
 
 
 def salvar_historico_etiquetas(data_entrega, pedidos):
     agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    resumo_list = []
+    resumo = []
     for p in pedidos:
-        itens = obter_itens(p["id"])
-        itens_txt = " + ".join([f"{i['produto']}" for i in itens])
-        resumo_list.append(f"Pedido #{p['id']} - Para: {p['cliente']} | Itens: {itens_txt}")
-    
-    detalhes = "\n".join(resumo_list)
-    with conectar() as con:
-        con.execute("""
-            INSERT INTO historico_etiquetas (data_geracao, data_filtro_entrega, total_pedidos, detalhes_pedidos)
-            VALUES (?, ?, ?, ?)
-        """, (agora, str(data_entrega), len(pedidos), detalhes))
+        itens_txt = " + ".join(i["produto"] for i in obter_itens(p["id"]))
+        resumo.append(f"Pedido #{p['id']} - Para: {p['cliente']} | Itens: {itens_txt}")
+    db.collection("historico_etiquetas").document().set({
+        "data_geracao": agora, "data_filtro_entrega": str(data_entrega),
+        "total_pedidos": len(pedidos), "detalhes_pedidos": "\n".join(resumo)
+    })
 
 
 def listar_historico_etiquetas():
-    with conectar() as con:
-        return con.execute("SELECT * FROM historico_etiquetas ORDER BY id DESC").fetchall()
+    return sorted(_docs("historico_etiquetas"), key=lambda x: x.get("data_geracao", ""), reverse=True)
 
-
-# --------------------------------------------------
-# FUNÇÕES AUXILIARES DE RETIRADAS
-# --------------------------------------------------
 
 def criar_retirada(nome_cliente, itens, observacoes):
     agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with conectar() as con:
-        con.execute("""
-            INSERT INTO retiradas (nome_cliente, itens, observacoes, data_registro, status)
-            VALUES (?, ?, ?, ?, 'Pendente')
-        """, (nome_cliente.strip(), itens.strip(), observacoes.strip(), agora))
+    db.collection("retiradas").document().set({"nome_cliente": nome_cliente.strip(), "itens": itens.strip(),
+        "observacoes": observacoes.strip(), "data_registro": agora, "status": "Pendente", "data_conclusao": None})
 
 
 def listar_retiradas(status=None):
-    sql = "SELECT * FROM retiradas WHERE 1=1"
-    parametros = []
+    dados = _docs("retiradas")
     if status:
-        sql += " AND status = ?"
-        parametros.append(status)
-    sql += " ORDER BY id DESC"
-    with conectar() as con:
-        return con.execute(sql, parametros).fetchall()
+        dados = [r for r in dados if r.get("status") == status]
+    return sorted(dados, key=lambda x: x.get("data_registro", ""), reverse=True)
 
 
 def atualizar_retirada(retirada_id, nome_cliente, itens, observacoes):
-    with conectar() as con:
-        con.execute("""
-            UPDATE retiradas
-            SET nome_cliente = ?, itens = ?, observacoes = ?
-            WHERE id = ?
-        """, (nome_cliente.strip(), itens.strip(), observacoes.strip(), retirada_id))
+    db.collection("retiradas").document(str(retirada_id)).update({"nome_cliente": nome_cliente.strip(), "itens": itens.strip(), "observacoes": observacoes.strip()})
 
 
 def concluir_retirada(retirada_id):
-    agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with conectar() as con:
-        con.execute("""
-            UPDATE retiradas
-            SET status = 'Concluída', data_conclusao = ?
-            WHERE id = ?
-        """, (agora, retirada_id))
+    db.collection("retiradas").document(str(retirada_id)).update({"status": "Concluída", "data_conclusao": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
 
 
 def excluir_retirada(retirada_id):
-    with conectar() as con:
-        con.execute("DELETE FROM retiradas WHERE id = ?", (retirada_id,))
+    db.collection("retiradas").document(str(retirada_id)).delete()
 
 
 # --------------------------------------------------
@@ -416,7 +487,7 @@ pagina = st.sidebar.radio(
 )
 
 st.sidebar.divider()
-st.sidebar.caption("Sistema local com banco SQLite")
+st.sidebar.caption("Sistema online com Firebase Firestore")
 
 
 # --------------------------------------------------
@@ -779,43 +850,25 @@ elif pagina == "Pedidos":
                         cliente_id = opcoes_clientes[cliente_escolhido]
 
                         try:
-                            with conectar() as con:
-                                cursor = con.execute("""
-                                    INSERT INTO pedidos (
-                                        cliente_id, data_pedido, data_entrega,
-                                        tipo_entrega, local_entrega, observacoes, status
-                                    )
-                                    VALUES (?, ?, ?, ?, ?, ?, 'Pendente')
-                                """, (
-                                    cliente_id,
-                                    str(data_pedido),
-                                    str(data_entrega),
-                                    "Entrega",
-                                    local_entrega.strip(),
-                                    observacoes.strip()
-                                ))
+                            itens_para_salvar = []
+                            for _, item in itens_validos.iterrows():
+                                prod_str = str(item["Produto"])
+                                nome_prod_limpo = prod_str.split(" (Disp:")[0].strip()
+                                itens_para_salvar.append({
+                                    "produto": nome_prod_limpo,
+                                    "quantidade": float(item["Quantidade"])
+                                })
 
-                                pedido_id = cursor.lastrowid
-
-                                for _, item in itens_validos.iterrows():
-                                    prod_str = str(item["Produto"])
-                                    nome_prod_limpo = prod_str.split(" (Disp:")[0].strip()
-                                    qtd_pedida = float(item["Quantidade"])
-
-                                    con.execute("""
-                                        INSERT INTO itens_pedido
-                                        (pedido_id, produto, quantidade, unidade)
-                                        VALUES (?, ?, ?, 'un')
-                                    """, (
-                                        pedido_id,
-                                        nome_prod_limpo,
-                                        qtd_pedida
-                                    ))
-
-                                    baixar_estoque(nome_prod_limpo, qtd_pedida, con=con)
-
-                                con.commit()
+                            pedido_id = criar_pedido_com_estoque(
+                                cliente_id=cliente_id,
+                                data_pedido=data_pedido,
+                                data_entrega=data_entrega,
+                                local_entrega=local_entrega,
+                                observacoes=observacoes,
+                                itens=itens_para_salvar
+                            )
                             st.success(f"Pedido #{pedido_id} cadastrado e estoque atualizado com sucesso!")
+                            st.rerun()
                         except Exception as e:
                             st.error(f"Erro ao salvar pedido: {e}")
 
