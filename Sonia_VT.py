@@ -360,7 +360,10 @@ def criar_pedido_com_estoque(cliente_id, data_pedido, data_entrega, local_entreg
 
     @firestore.transactional
     def executar(transaction):
-        snapshots = {nome: transaction.get(ref) for nome, ref in produtos.items()}
+        snapshots = {
+            nome: next(transaction.get(ref))
+            for nome, ref in produtos.items()
+        }
         for item in itens:
             nome = item["produto"].strip()
             qtd = float(item["quantidade"])
