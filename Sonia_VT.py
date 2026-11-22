@@ -80,8 +80,14 @@ class ConexaoFirestore:
         p = tuple(params or ())
 
         if q.startswith("insert into clientes"):
+            numero = obter_proximo_numero_cliente()
             ref = db.collection("clientes").document()
-            ref.set({"nome": p[0], "telefone": p[1], "observacoes": p[2]})
+            ref.set({
+                "numero": numero,
+                "nome": p[0],
+                "telefone": p[1],
+                "observacoes": p[2],
+            })
             return ResultadoFirestore(lastrowid=ref.id)
 
         if q.startswith("update clientes"):
@@ -127,8 +133,7 @@ class ConexaoFirestore:
                 def baixar(transaction):
                     snap = ref.get(transaction=transaction)
                     atual = float(snap.get("quantidade") or 0)
-                    if atual < float(qtd):
-                        raise ValueError(f"Estoque insuficiente para {nome}. Disponível: {atual:g}")
+                    # O saldo pode ficar negativo: representa produto vendido sob encomenda.
                     transaction.update(ref, {"quantidade": atual - float(qtd)})
 
                 baixar(db.transaction())
@@ -344,6 +349,77 @@ def baixar_estoque(produto, quantidade, con=None):
     )
 
 
+def obter_proximo_numero_pedido():
+    """Gera o próximo número sequencial de pedido de forma atômica."""
+    counter_ref = db.collection("counters").document("pedidos")
+
+    @firestore.transactional
+    def incrementar(transaction):
+        snap = counter_ref.get(transaction=transaction)
+        if snap.exists:
+            atual = int(snap.get("ultimo") or 0)
+        else:
+            # Se o contador ainda não existe, descobre o maior número já usado
+            atual = 0
+            for p in db.collection("pedidos").stream():
+                n = p.to_dict().get("numero")
+                if n is not None:
+                    try:
+                        atual = max(atual, int(n))
+                    except (TypeError, ValueError):
+                        pass
+        novo = atual + 1
+        transaction.set(counter_ref, {"ultimo": novo}, merge=True)
+        return novo
+
+    return incrementar(db.transaction())
+
+
+def numero_pedido(pedido):
+    """Retorna o número amigável do pedido (sequencial). Fallback para ID antigo."""
+    if isinstance(pedido, dict):
+        n = pedido.get("numero")
+        if n is not None:
+            return n
+        return pedido.get("id", "?")
+    return pedido
+
+
+def obter_proximo_numero_cliente():
+    """Gera o próximo número sequencial de cliente de forma atômica."""
+    counter_ref = db.collection("counters").document("clientes")
+
+    @firestore.transactional
+    def incrementar(transaction):
+        snap = counter_ref.get(transaction=transaction)
+        if snap.exists:
+            atual = int(snap.get("ultimo") or 0)
+        else:
+            atual = 0
+            for c in db.collection("clientes").stream():
+                n = c.to_dict().get("numero")
+                if n is not None:
+                    try:
+                        atual = max(atual, int(n))
+                    except (TypeError, ValueError):
+                        pass
+        novo = atual + 1
+        transaction.set(counter_ref, {"ultimo": novo}, merge=True)
+        return novo
+
+    return incrementar(db.transaction())
+
+
+def numero_cliente(cliente):
+    """Retorna o número amigável do cliente (sequencial). Fallback para ID antigo."""
+    if isinstance(cliente, dict):
+        n = cliente.get("numero")
+        if n is not None:
+            return n
+        return cliente.get("id", "?")
+    return cliente
+
+
 def criar_pedido_com_estoque(cliente_id, data_pedido, data_entrega, local_entrega, observacoes, itens):
     """Cria o pedido e baixa todo o estoque em uma única transação Firestore."""
     produtos = {}
@@ -353,6 +429,9 @@ def criar_pedido_com_estoque(cliente_id, data_pedido, data_entrega, local_entreg
         if not encontrados:
             raise ValueError(f"Produto não encontrado no estoque: {nome}")
         produtos[nome] = encontrados[0].reference
+
+    # Gera o número sequencial ANTES da transação principal
+    numero = obter_proximo_numero_pedido()
 
     pedido_ref = db.collection("pedidos").document()
     itens_refs = [(pedido_ref.collection("itens").document(), item) for item in itens]
@@ -371,14 +450,13 @@ def criar_pedido_com_estoque(cliente_id, data_pedido, data_entrega, local_entreg
             if not snap.exists:
                 raise ValueError(f"Produto não encontrado no estoque: {nome}")
             disponivel = float(snap.get("quantidade") or 0)
-            if qtd <= 0 or disponivel < qtd:
-                raise ValueError(
-                    f"Estoque insuficiente para {nome}. Disponível: {disponivel:g}; solicitado: {qtd:g}."
-                )
+            if qtd <= 0:
+                raise ValueError(f"A quantidade de {nome} deve ser maior que zero.")
 
         transaction.set(
             pedido_ref,
             {
+                "numero": numero,  # número sequencial amigável
                 "cliente_id": str(cliente_id),
                 "data_pedido": str(data_pedido),
                 "data_entrega": str(data_entrega),
@@ -405,7 +483,7 @@ def criar_pedido_com_estoque(cliente_id, data_pedido, data_entrega, local_entreg
             transaction.update(ref, {"quantidade": atual - total})
 
     executar(transaction)
-    return pedido_ref.id
+    return pedido_ref.id, numero  # retorna também o número sequencial
 
 
 def listar_pedidos(data_filtro=None, status=None):
@@ -465,12 +543,61 @@ def atualizar_status_pedido(pedido_id):
         })
 
 
+def cancelar_pedido_e_devolver_estoque(pedido_id):
+    """Cancela um pedido e devolve suas quantidades ao estoque uma única vez."""
+    pedido_ref = db.collection("pedidos").document(str(pedido_id))
+    itens = obter_itens(pedido_id)
+
+    @firestore.transactional
+    def executar(transaction):
+        pedido_snap = pedido_ref.get(transaction=transaction)
+        if not pedido_snap.exists:
+            raise ValueError("Pedido não encontrado.")
+        dados_pedido = pedido_snap.to_dict() or {}
+
+        if dados_pedido.get("status") == "Entregue":
+            raise ValueError("Um pedido já entregue não pode ser cancelado por esta opção.")
+
+        if dados_pedido.get("status") == "Cancelado" or dados_pedido.get("estoque_devolvido", False):
+            return False
+
+        refs_por_produto = {}
+        for item in itens:
+            nome = str(item.get("produto", "")).strip()
+            encontrados = list(db.collection("estoque").where("produto", "==", nome).limit(1).stream())
+            if not encontrados:
+                raise ValueError(f"O produto '{nome}' não existe mais no estoque. Recoloque-o no cadastro antes de cancelar.")
+            refs_por_produto[nome] = encontrados[0].reference
+
+        snapshots = {nome: next(transaction.get(ref)) for nome, ref in refs_por_produto.items()}
+        totais = {}
+        for item in itens:
+            nome = str(item.get("produto", "")).strip()
+            totais[nome] = totais.get(nome, 0.0) + float(item.get("quantidade") or 0)
+
+        for nome, ref in refs_por_produto.items():
+            snap = snapshots[nome]
+            if not snap.exists:
+                raise ValueError(f"Produto '{nome}' não encontrado no estoque.")
+            atual = float(snap.get("quantidade") or 0)
+            transaction.update(ref, {"quantidade": atual + totais[nome]})
+
+        transaction.update(pedido_ref, {
+            "status": "Cancelado",
+            "estoque_devolvido": True,
+            "data_cancelamento": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        return True
+
+    return executar(db.transaction())
+
+
 def salvar_historico_etiquetas(data_entrega, pedidos):
     agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     resumo = []
     for p in pedidos:
         itens_txt = " + ".join(i["produto"] for i in obter_itens(p["id"]))
-        resumo.append(f"Pedido #{p['id']} - Para: {p['cliente']} | Itens: {itens_txt}")
+        resumo.append(f"Pedido #{numero_pedido(p)} - Para: {p['cliente']} | Itens: {itens_txt}")
     db.collection("historico_etiquetas").document().set({
         "data_geracao": agora,
         "data_filtro_entrega": str(data_entrega),
@@ -481,6 +608,10 @@ def salvar_historico_etiquetas(data_entrega, pedidos):
 
 def listar_historico_etiquetas():
     return sorted(_docs("historico_etiquetas"), key=lambda x: x.get("data_geracao", ""), reverse=True)
+
+
+def excluir_historico_etiqueta(historico_id):
+    db.collection("historico_etiquetas").document(str(historico_id)).delete()
 
 
 def criar_retirada(nome_cliente, itens, observacoes):
@@ -525,6 +656,32 @@ def excluir_retirada(retirada_id):
 # GERADOR DE ETIQUETAS EM PDF
 # --------------------------------------------------
 
+def expandir_etiquetas_pedido(pedido):
+    """Retorna uma lista de etiquetas (1 por unidade de item) com contador por item."""
+    itens = obter_itens(pedido["id"])
+    info_obs = pedido["local_entrega"]
+    if pedido.get("observacoes"):
+        info_obs += f" ({pedido['observacoes']})"
+
+    unidades = []
+    for item in itens:
+        nome_produto = str(item.get("produto", "")).strip()
+        qtd_bruta = float(item.get("quantidade") or 0)
+        qtd_etiquetas = max(1, int(round(qtd_bruta))) if qtd_bruta > 0 else 0
+
+        for idx_item in range(1, qtd_etiquetas + 1):
+            unidades.append({
+                "de": "Sônia Vende Tudo",
+                "para": pedido["cliente"],
+                "produto": nome_produto,
+                "item_indice": idx_item,
+                "item_total": qtd_etiquetas,
+                "obs": info_obs,
+            })
+
+    return unidades
+
+
 def gerar_pdf_etiquetas(pedidos):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -557,9 +714,9 @@ def gerar_pdf_etiquetas(pedidos):
     style_itens = ParagraphStyle(
         "EtiquetaItens",
         parent=styles["Normal"],
-        fontSize=9.5,
-        leading=12,
-        fontName="Helvetica",
+        fontSize=10.5,
+        leading=13,
+        fontName="Helvetica-Bold",
         textColor=colors.HexColor("#111111"),
     )
     style_obs = ParagraphStyle(
@@ -574,32 +731,29 @@ def gerar_pdf_etiquetas(pedidos):
     cards = []
 
     for p in pedidos:
-        itens = obter_itens(p["id"])
-        itens_txt = " + ".join([i["produto"] for i in itens])
+        etiquetas = expandir_etiquetas_pedido(p)
+        for etq in etiquetas:
+            texto_item = f"{etq['produto']} ({etq['item_indice']}/{etq['item_total']})"
 
-        info_obs = p["local_entrega"]
-        if p["observacoes"]:
-            info_obs += f" ({p['observacoes']})"
+            conteudo = [
+                Paragraph(f"<b>De: {etq['de']}</b>", style_de),
+                Paragraph(f"<b>Para: {etq['para']}</b>", style_para),
+                Paragraph(texto_item, style_itens),
+                Paragraph(f"<b>Obs:</b> {etq['obs']}", style_obs),
+            ]
 
-        conteudo = [
-            Paragraph("<b>De: Sônia Vende Tudo</b>", style_de),
-            Paragraph(f"<b>Para: {p['cliente']}</b>", style_para),
-            Paragraph(f"{itens_txt}", style_itens),
-            Paragraph(f"<b>Obs:</b> {info_obs}", style_obs),
-        ]
-
-        t_card = Table([[c] for c in conteudo], colWidths=[9.2 * cm])
-        t_card.setStyle(
-            TableStyle([
-                ("BOX", (0, 0), (-1, -1), 1.2, colors.HexColor("#333333")),
-                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#FFFFFF")),
-                ("TOPPADDING", (0, 0), (-1, -1), 8),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-                ("LEFTPADDING", (0, 0), (-1, -1), 10),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 10),
-            ])
-        )
-        cards.append(t_card)
+            t_card = Table([[c] for c in conteudo], colWidths=[9.2 * cm])
+            t_card.setStyle(
+                TableStyle([
+                    ("BOX", (0, 0), (-1, -1), 1.2, colors.HexColor("#333333")),
+                    ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#FFFFFF")),
+                    ("TOPPADDING", (0, 0), (-1, -1), 8),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 10),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+                ])
+            )
+            cards.append(t_card)
 
     rows = []
     for i in range(0, len(cards), 2):
@@ -712,7 +866,7 @@ if pagina == "Painel inicial":
         dados = []
         for p in pedidos_sabado:
             dados.append({
-                "Pedido": p["id"],
+                "Pedido": numero_pedido(p),
                 "Cliente": p["cliente"],
                 "Local": p["local_entrega"],
                 "Status": p["status"],
@@ -741,14 +895,18 @@ elif pagina == "Clientes":
                 st.error("Informe o nome do cliente.")
             else:
                 with conectar() as con:
-                    con.execute(
+                    resultado = con.execute(
                         """
                         INSERT INTO clientes (nome, telefone, observacoes)
                         VALUES (?, ?, ?)
                         """,
                         (nome.strip(), telefone.strip(), observacoes.strip()),
                     )
-                st.success("Cliente cadastrado!")
+                # Busca o número gerado para mostrar na mensagem
+                clientes_atual = listar_clientes()
+                novo = next((c for c in clientes_atual if c["id"] == resultado.lastrowid), None)
+                n = numero_cliente(novo) if novo else "?"
+                st.success(f"Cliente #{n} cadastrado com sucesso!")
                 st.rerun()
 
     st.divider()
@@ -763,7 +921,7 @@ elif pagina == "Clientes":
                 col1, col2, col3 = st.columns([4, 1, 1])
 
                 with col1:
-                    st.markdown(f"**{c['nome']}**")
+                    st.markdown(f"**#{numero_cliente(c)} — {c['nome']}**")
                     if c.get("telefone"):
                         st.caption(f"📞 {c['telefone']}")
                     if c.get("observacoes"):
@@ -839,7 +997,9 @@ elif pagina == "Clientes":
 elif pagina == "Estoque":
     st.title("📦 Controle de Estoque")
 
-    aba_cad, aba_ger = st.tabs(["➕ Cadastrar Item", "📋 Gerenciar Estoque"])
+    aba_cad, aba_ger, aba_encomendar = st.tabs([
+        "➕ Cadastrar Item", "📋 Gerenciar Estoque", "🛒 Itens a encomendar"
+    ])
 
     with aba_cad:
         st.subheader("Adicionar Novo Item ao Estoque")
@@ -931,6 +1091,19 @@ elif pagina == "Estoque":
                                 st.session_state[f"confirm_del_est_{item['id']}"] = False
                                 st.rerun()
 
+    with aba_encomendar:
+        st.subheader("🛒 Produtos que precisam ser encomendados")
+        itens_encomenda = [e for e in listar_estoque() if float(e.get("quantidade") or 0) < 0]
+        if not itens_encomenda:
+            st.success("Nenhum produto com saldo negativo. Não há encomendas pendentes pelo estoque.")
+        else:
+            st.caption("O saldo negativo indica quantas unidades foram vendidas além do estoque disponível.")
+            for item in itens_encomenda:
+                falta = abs(float(item.get("quantidade") or 0))
+                with st.container(border=True):
+                    st.markdown(f"**{item['produto']}**")
+                    st.markdown(f"Quantidade a encomendar: **{falta:g}**")
+
 
 # --------------------------------------------------
 # PEDIDOS (NOVO PEDIDO & GERENCIAR PEDIDOS)
@@ -951,7 +1124,7 @@ elif pagina == "Pedidos":
             st.warning("Cadastre itens no **Estoque** antes de criar um pedido para poder selecioná-los.")
         else:
             opcoes_clientes = {
-                f'{c["nome"]} (ID {c["id"]})': c["id"]
+                f'#{numero_cliente(c)} — {c["nome"]}': c["id"]
                 for c in clientes
             }
 
@@ -1024,7 +1197,7 @@ elif pagina == "Pedidos":
                             })
 
                         try:
-                            pedido_id = criar_pedido_com_estoque(
+                            pedido_id, numero = criar_pedido_com_estoque(
                                 cliente_id=cliente_id,
                                 data_pedido=data_pedido,
                                 data_entrega=data_entrega,
@@ -1032,12 +1205,12 @@ elif pagina == "Pedidos":
                                 observacoes=observacoes,
                                 itens=itens_para_salvar,
                             )
-                            st.success(f"Pedido #{pedido_id} cadastrado e estoque atualizado com sucesso!")
+                            st.success(f"Pedido #{numero} cadastrado e estoque atualizado com sucesso!")
                         except Exception as e:
                             st.error(f"Erro ao salvar pedido: {e}")
 
     with aba_gerenciar:
-        pedidos = listar_pedidos()
+        pedidos = [p for p in listar_pedidos() if p.get("status") != "Cancelado"]
 
         if not pedidos:
             st.info("Nenhum pedido cadastrado.")
@@ -1061,7 +1234,9 @@ elif pagina == "Pedidos":
                 pedidos_filtrados = [
                     p
                     for p in pedidos_filtrados
-                    if busca_lower in p["cliente"].lower() or busca_lower in str(p["id"])
+                    if busca_lower in p["cliente"].lower()
+                    or busca_lower in str(numero_pedido(p))
+                    or busca_lower in str(p["id"])
                 ]
 
             if not pedidos_filtrados:
@@ -1073,7 +1248,7 @@ elif pagina == "Pedidos":
 
                         with col_info:
                             st.markdown(
-                                f"**Pedido #{p['id']}** — {p['cliente']}  \n"
+                                f"**Pedido #{numero_pedido(p)}** — {p['cliente']}  \n"
                                 f"📅 Pedido: {formatar_data(p.get('data_pedido'))} | "
                                 f"Entrega: {formatar_data(p['data_entrega'])} | "
                                 f"Status: **{p['status']}**  \n"
@@ -1081,25 +1256,48 @@ elif pagina == "Pedidos":
                                 f"Itens: {p['itens_separados']}/{p['total_itens']} separados"
                             )
 
-                        with col_acoes:
-                            if st.button("🗑️ Excluir", key=f"excluir_ped_{p['id']}"):
-                                st.session_state[f"confirmar_exclusao_ped_{p['id']}"] = True
+                        # Permite consultar os produtos e quantidades de cada pedido.
+                        with st.expander(f"🛍️ Visualizar itens do pedido #{numero_pedido(p)}"):
+                            itens_pedido = obter_itens(p["id"])
+                            if not itens_pedido:
+                                st.info("Este pedido não possui itens cadastrados.")
+                            else:
+                                for item in itens_pedido:
+                                    nome_item = item.get("produto", "Produto sem nome")
+                                    quantidade = float(item.get("quantidade") or 0)
+                                    separado = bool(item.get("separado"))
+                                    status_item = "✅ Separado" if separado else "⏳ Pendente"
+                                    st.markdown(
+                                        f"- **{nome_item}** — Quantidade: **{quantidade:g}** "
+                                        f"— {status_item}"
+                                    )
 
-                        if st.session_state.get(f"confirmar_exclusao_ped_{p['id']}", False):
+                        with col_acoes:
+                            if p.get("status") != "Entregue" and p.get("status") != "Cancelado":
+                                if st.button("🚫 Cancelar pedido", key=f"cancelar_ped_{p['id']}"):
+                                    st.session_state[f"confirmar_cancelamento_ped_{p['id']}"] = True
+
+                        if st.session_state.get(f"confirmar_cancelamento_ped_{p['id']}", False):
                             st.warning(
-                                f"Tem certeza que deseja excluir o **Pedido #{p['id']}** de **{p['cliente']}**?"
+                                f"Cancelar o **Pedido #{numero_pedido(p)}** de **{p['cliente']}**? "
+                                "As quantidades dos produtos serão devolvidas ao estoque."
                             )
                             col_sim, col_nao = st.columns(2)
                             with col_sim:
-                                if st.button("Sim, excluir", key=f"confirma_exc_ped_{p['id']}", type="primary"):
-                                    with conectar() as con:
-                                        con.execute("DELETE FROM pedidos WHERE id = ?", (p["id"],))
-                                    st.success(f"Pedido #{p['id']} excluído!")
-                                    st.session_state[f"confirmar_exclusao_ped_{p['id']}"] = False
-                                    st.rerun()
+                                if st.button("Sim, cancelar pedido", key=f"confirma_cancel_ped_{p['id']}", type="primary"):
+                                    try:
+                                        devolvido = cancelar_pedido_e_devolver_estoque(p["id"])
+                                        st.session_state[f"confirmar_cancelamento_ped_{p['id']}"] = False
+                                        if devolvido:
+                                            st.success(f"Pedido #{numero_pedido(p)} cancelado e estoque devolvido!")
+                                        else:
+                                            st.info("Este pedido já estava cancelado; o estoque não foi alterado novamente.")
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(f"Não foi possível cancelar o pedido: {e}")
                             with col_nao:
-                                if st.button("Cancelar", key=f"cancela_exc_ped_{p['id']}"):
-                                    st.session_state[f"confirmar_exclusao_ped_{p['id']}"] = False
+                                if st.button("Manter pedido", key=f"manter_ped_{p['id']}"):
+                                    st.session_state[f"confirmar_cancelamento_ped_{p['id']}"] = False
                                     st.rerun()
 
 
@@ -1114,57 +1312,92 @@ elif pagina == "Checklist":
 
     with aba_separacao:
         st.subheader("Checklist de separação")
-        st.write("Marque os produtos conforme forem colocados na sacola.")
+        st.write(
+            "Escolha a data de entrega, confira todos os pedidos e marque os produtos "
+            "conforme forem colocados nas sacolas."
+        )
 
-        pedidos = [p for p in listar_pedidos() if p["status"] != "Entregue"]
+        data_separacao = st.date_input(
+            "Filtrar pela data de entrega",
+            value=proximo_sabado(),
+            key="data_checklist_separacao",
+            format="DD/MM/YYYY",
+        )
 
-        if not pedidos:
-            st.info("Não há pedidos pendentes de separação.")
+        pedidos_separacao = [
+            p for p in listar_pedidos(data_filtro=data_separacao)
+            if p["status"] not in ("Entregue", "Cancelado")
+        ]
+
+        if not pedidos_separacao:
+            st.info("Não há pedidos pendentes de separação para esta data.")
         else:
-            opcoes = {
-                f'Pedido #{p["id"]} - {p["cliente"]} ({p["itens_separados"]}/{p["total_itens"]} separados)': p["id"]
-                for p in pedidos
-            }
+            st.success(
+                f"{len(pedidos_separacao)} pedido(s) encontrado(s) para "
+                f"{formatar_data(data_separacao)}."
+            )
 
-            pedido_label = st.selectbox("Selecione o pedido", list(opcoes.keys()), key="select_sep_pedido")
-            pedido_id = opcoes[pedido_label]
-            pedido = next(p for p in pedidos if p["id"] == pedido_id)
+            marcacoes = {}
+            pedidos_ids = []
 
-            st.write(f'**Cliente:** {pedido["cliente"]}')
-            st.write(f'**Entrega:** {formatar_data(pedido["data_entrega"])}')
-            st.write(f'**Local:** {pedido["local_entrega"]}')
+            with st.form("form_separacao_todos"):
+                for p in pedidos_separacao:
+                    pedido_id = p["id"]
+                    pedidos_ids.append(pedido_id)
 
-            itens = obter_itens(pedido_id)
-
-            with st.form(f"form_separacao_{pedido_id}"):
-                marcacoes = {}
-                for item in itens:
-                    marcacoes[item["id"]] = st.checkbox(
-                        f'{item["produto"]} — {item["quantidade"]:g}',
-                        value=bool(item.get("separado")),
-                        key=f'separacao_{item["id"]}',
+                    st.markdown("---")
+                    st.subheader(
+                        f'Pedido #{numero_pedido(p)} — {p["cliente"]}'
+                    )
+                    st.write(f'**Entrega:** {formatar_data(p["data_entrega"])}')
+                    st.write(f'**Local:** {p["local_entrega"]}')
+                    st.write(
+                        f'**Separação atual:** '
+                        f'{p["itens_separados"]}/{p["total_itens"]} itens'
                     )
 
-                salvar_separacao = st.form_submit_button("Salvar checklist")
+                    itens = obter_itens(pedido_id)
+                    if not itens:
+                        st.caption("Este pedido não possui itens cadastrados.")
 
-                if salvar_separacao:
-                    with conectar() as con:
-                        for item_id, separado in marcacoes.items():
-                            con.execute(
-                                """
-                                UPDATE itens_pedido
-                                SET separado = ?
-                                WHERE id = ? AND pedido_id = ?
-                                """,
-                                (int(separado), item_id, pedido_id),
-                            )
+                    for item in itens:
+                        marcacoes[item["id"]] = st.checkbox(
+                            f'{item["produto"]} — {item["quantidade"]:g}',
+                            value=bool(item.get("separado")),
+                            key=f'sep_todos_{pedido_id}_{item["id"]}',
+                        )
 
-                    atualizar_status_pedido(pedido_id)
-                    st.success("Checklist de separação atualizado.")
-                    st.rerun()
+                st.markdown("---")
+                salvar_todos = st.form_submit_button(
+                    "💾 Salvar todos os checklists",
+                    type="primary",
+                    use_container_width=True,
+                )
 
-            separados = sum(bool(item.get("separado")) for item in itens)
-            st.progress(separados / len(itens) if itens else 0)
+                if salvar_todos:
+                    try:
+                        with conectar() as con:
+                            for pedido in pedidos_separacao:
+                                pedido_id = pedido["id"]
+                                for item in obter_itens(pedido_id):
+                                    separado = marcacoes.get(item["id"], False)
+                                    con.execute(
+                                        """
+                                        UPDATE itens_pedido
+                                        SET separado = ?
+                                        WHERE id = ? AND pedido_id = ?
+                                        """,
+                                        (int(separado), item["id"], pedido_id),
+                                    )
+
+                        for pedido_id in pedidos_ids:
+                            atualizar_status_pedido(pedido_id)
+
+                        st.success("Todos os checklists foram salvos com sucesso!")
+                        st.rerun()
+
+                    except Exception as e:
+                        st.error(f"Erro ao salvar os checklists: {e}")
 
     with aba_entregas:
         st.subheader("Checklist de entregas")
@@ -1183,7 +1416,7 @@ elif pagina == "Checklist":
         else:
             for p in pedidos_sab:
                 with st.container(border=True):
-                    st.subheader(f'Pedido #{p["id"]} — {p["cliente"]}')
+                    st.subheader(f'Pedido #{numero_pedido(p)} — {p["cliente"]}')
                     st.write(f'**Local:** {p["local_entrega"]}')
                     st.write(f'**Separação:** {p["itens_separados"]}/{p["total_itens"]} itens')
 
@@ -1387,21 +1620,23 @@ elif pagina == "Etiquetas e Histórico":
         if not pedidos:
             st.info("Nenhum pedido encontrado para esta data.")
         else:
+            todas_etiquetas = []
+            for p in pedidos:
+                todas_etiquetas.extend(expandir_etiquetas_pedido(p))
+
             st.success(
-                f"Encontrados {len(pedidos)} pedido(s) para a entrega de {formatar_data(data_entrega)}."
+                f"Encontrados {len(pedidos)} pedido(s) -> **{len(todas_etiquetas)} etiqueta(s)** para a entrega de {formatar_data(data_entrega)}."
             )
 
             st.subheader("Pré-visualização do formato das etiquetas:")
-            for p in pedidos:
-                itens = obter_itens(p["id"])
-                itens_txt = " + ".join([i["produto"] for i in itens])
-                info_obs = p["local_entrega"] + (f" ({p['observacoes']})" if p.get("observacoes") else "")
+            for etq in todas_etiquetas:
+                texto_item = f"{etq['produto']} ({etq['item_indice']}/{etq['item_total']})"
 
                 st.info(
-                    f"**De: Sônia Vende Tudo**  \n"
-                    f"**Para: {p['cliente']}**  \n"
-                    f"{itens_txt}  \n"
-                    f"*Obs:* {info_obs}"
+                    f"**De: {etq['de']}**  \n"
+                    f"**Para: {etq['para']}**  \n"
+                    f"**{texto_item}**  \n"
+                    f"*Obs:* {etq['obs']}"
                 )
 
             pdf_bytes = gerar_pdf_etiquetas(pedidos)
@@ -1433,6 +1668,23 @@ elif pagina == "Etiquetas e Histórico":
                 )
                 with st.expander(titulo):
                     st.text(h.get("detalhes_pedidos", ""))
+
+                    if st.button("🗑️ Excluir este registro", key=f"del_hist_etiq_{h['id']}"):
+                        st.session_state[f"confirm_del_hist_etiq_{h['id']}"] = True
+
+                    if st.session_state.get(f"confirm_del_hist_etiq_{h['id']}", False):
+                        st.warning("Tem certeza que deseja apagar este registro do histórico de etiquetas?")
+                        col_sim, col_nao = st.columns(2)
+                        with col_sim:
+                            if st.button("Sim, apagar", key=f"conf_del_hist_etiq_{h['id']}", type="primary"):
+                                excluir_historico_etiqueta(h["id"])
+                                st.session_state[f"confirm_del_hist_etiq_{h['id']}"] = False
+                                st.success("Registro removido do histórico!")
+                                st.rerun()
+                        with col_nao:
+                            if st.button("Cancelar", key=f"canc_del_hist_etiq_{h['id']}"):
+                                st.session_state[f"confirm_del_hist_etiq_{h['id']}"] = False
+                                st.rerun()
 
 
 # --------------------------------------------------
@@ -1475,7 +1727,7 @@ elif pagina == "Histórico Geral":
         dados = []
         for p in filtrados:
             dados.append({
-                "Pedido": p["id"],
+                "Pedido": numero_pedido(p),
                 "Cliente": p["cliente"],
                 "Telefone": p.get("telefone", ""),
                 "Data do pedido": formatar_data(p.get("data_pedido")),
