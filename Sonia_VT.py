@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import io
 import sqlite3  # usado apenas para manter o tratamento de duplicidade na interface
 from datetime import date, datetime, timedelta
@@ -26,6 +28,74 @@ st.set_page_config(
     page_icon="📦",
     layout="wide",
 )
+
+
+# --------------------------------------------------
+# AUTENTICAÇÃO / TELA DE LOGIN
+# --------------------------------------------------
+
+def _hash_texto(valor: str) -> str:
+    return hashlib.sha256(valor.encode("utf-8")).hexdigest()
+
+
+def _validar_credenciais(usuario_digitado: str, senha_digitada: str) -> bool:
+    auth_cfg = st.secrets.get("auth")
+    if not auth_cfg:
+        st.error("Configure a seção [auth] com 'usuario' e 'senha' nos Secrets do Streamlit.")
+        return False
+
+    usuario_esperado = str(auth_cfg.get("usuario", "")).strip()
+    senha_esperada = str(auth_cfg.get("senha", ""))
+
+    if not usuario_esperado or not senha_esperada:
+        st.error("Os campos 'usuario' e 'senha' devem estar preenchidos em [auth] nos Secrets.")
+        return False
+
+    usuario_ok = hmac.compare_digest(
+        _hash_texto(usuario_digitado.strip().lower()),
+        _hash_texto(usuario_esperado.lower()),
+    )
+    senha_ok = hmac.compare_digest(
+        _hash_texto(senha_digitada),
+        _hash_texto(senha_esperada),
+    )
+    return usuario_ok and senha_ok
+
+
+def exigir_login():
+    if "autenticado" not in st.session_state:
+        st.session_state["autenticado"] = False
+
+    if st.session_state["autenticado"]:
+        return
+
+    _, col_centro, _ = st.columns([1, 1.4, 1])
+    with col_centro:
+        logo_path = PASTA / "logo.jpg"
+        if logo_path.exists():
+            st.image(str(logo_path), width=260)
+        st.title("🔐 Acesso — Sonia Vende Tudo")
+        st.caption("Entre com suas credenciais para acessar o sistema.")
+
+        with st.form("form_login", clear_on_submit=False):
+            usuario = st.text_input("Usuário", placeholder="Digite seu usuário")
+            senha = st.text_input("Senha", type="password", placeholder="Digite sua senha")
+            entrar = st.form_submit_button("Entrar", type="primary", use_container_width=True)
+
+            if entrar:
+                if not usuario.strip() or not senha:
+                    st.error("Preencha o usuário e a senha.")
+                elif _validar_credenciais(usuario, senha):
+                    st.session_state["autenticado"] = True
+                    st.session_state["usuario_logado"] = usuario.strip()
+                    st.rerun()
+                else:
+                    st.error("Usuário ou senha inválidos.")
+
+    st.stop()
+
+
+exigir_login()
 
 
 # --------------------------------------------------
@@ -796,7 +866,11 @@ pagina = st.sidebar.radio(
 )
 
 st.sidebar.divider()
-st.sidebar.caption("Sistema online com Firebase Firestore")
+
+if st.sidebar.button("🚪 Sair", use_container_width=True):
+    st.session_state["autenticado"] = False
+    st.session_state.pop("usuario_logado", None)
+    st.rerun()
 
 
 # --------------------------------------------------
@@ -1462,9 +1536,9 @@ elif pagina == "Retiradas":
     ])
 
     with aba_nova:
-        st.subheader("Nova Retirada Presencial")
+        st.subheader("Nova Retirada")
         with st.form("form_nova_retirada", clear_on_submit=True):
-            nome_cli = st.text_input("Nome do Cliente *", placeholder="Ex.: Maria Souza")
+            nome_cli = st.text_input("Nome * ", placeholder="Ex.: Maria Souza")
             itens_ret = st.text_area(
                 "Item / Itens a retirar *",
                 placeholder="Ex.: Panela de Pressão Electrolux + Conjunto de Copos",
